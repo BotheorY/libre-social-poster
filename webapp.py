@@ -1,44 +1,49 @@
-from flask import Flask, Response, request, jsonify, render_template, redirect, url_for
-import sys
 import os
-import uuid
+import io
 import json
+import uuid
+import math
+from flask import Flask, Response, request, jsonify, redirect, url_for, render_template
+import mysql.connector
 import boto3
-from botocore.exceptions import BotoCoreError, ClientError
-import pymysql
-from pymysql.cursors import DictCursor
 from datetime import datetime
+import sys
 import pytz
 
 app = Flask(__name__)
 DEBUG_MODE = True
 LOCAL_FOLDER_PATH = '/home/botheory/fracassi/'
 
-# Carica configurazioni AWS
-with open(LOCAL_FOLDER_PATH + 'assets/aws_config.json') as f:
+# ------------------------------------------------
+# Lettura credenziali AWS da file JSON
+# ------------------------------------------------
+with open(LOCAL_FOLDER_PATH + 'assets/aws_config.json', 'r') as f:
     aws_config = json.load(f)
 
-AWS_ACCESS_KEY_ID = aws_config['aws_access_key_id']
-AWS_SECRET_ACCESS_KEY = aws_config['aws_secret_access_key']
-AWS_REGION = aws_config['region_name']
-S3_BUCKET = aws_config['s3_bucket']
+AWS_ACCESS_KEY = aws_config['aws_access_key_id']
+AWS_SECRET_KEY = aws_config['aws_secret_access_key']
+AWS_REGION = aws_config['aws_region']
+S3_BUCKET_NAME = aws_config['s3_bucket_name']
 
-# Carica configurazioni Database
-with open(LOCAL_FOLDER_PATH + 'assets/db_config.json') as f:
-    db_config = json.load(f)
-
-DB_HOST = db_config['host']
-DB_USER = db_config['user']
-DB_PASSWORD = db_config['password']
-DB_NAME = db_config['database']
-
-# Inizializza client S3
+# Creazione client boto3
 s3_client = boto3.client(
     's3',
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=AWS_REGION
+    region_name=AWS_REGION,
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY
 )
+
+# ------------------------------------------------
+# Lettura credenziali DB MySQL da file JSON
+# ------------------------------------------------
+with open(LOCAL_FOLDER_PATH + 'assets/db_config.json', 'r') as f:
+    db_conf = json.load(f)
+
+DB_HOST = db_conf['host']
+DB_PORT = db_conf['port']
+DB_NAME = db_conf['database']
+DB_USER = db_conf['user']
+DB_PASS = db_conf['password']
 
 # Sessioni di upload in memoria
 upload_sessions = {}
@@ -48,179 +53,144 @@ CHUNK_SIZE = 5 * 1024 * 1024
 
 @app.route('/api/s3send', methods=['PUT'])
 def api_s3send():
+    """
+    Riceve il file via PUT, lo carica su S3 in modalità streaming a chunk,
+    aggiorna la tabella s3_progress su MySQL e restituisce un UUID.
+    """
+    # Generiamo un nuovo UUID per questa operazione di upload
+    upload_uuid = str(uuid.uuid4())
+
+    # Preparazione tabella: inserimento riga con PROGRESS
+    cnx = get_db_connection()
+    cursor = cnx.cursor()
+    insert_stmt = """
+        INSERT INTO s3_progress (upload_uuid, prg_status, progress)
+        VALUES (%s, 'PROGRESS', 0)
+    """
+    cursor.execute(insert_stmt, (upload_uuid,))
+    cnx.commit()
+
+    # Inizializziamo una multi-part upload su S3
     try:
-        # Estrai parametri dalla richiesta
-        upload_uuid = request.form.get('upload_uuid')
-        file_part = request.files.get('file_part')
-        part_number = int(request.form.get('part_number'))
-        file_name = request.form.get('file_name')
-        file_size = int(request.form.get('file_size', 0))  # Solo nel primo chunk
+        create_mpu = s3_client.create_multipart_upload(Bucket=S3_BUCKET_NAME,
+                                                       Key=f'upload_{upload_uuid}')
+        upload_id = create_mpu['UploadId']
 
-        if not file_part or not part_number or not file_name:
-            return jsonify({'error': 'Parametri mancanti'}), 400
+        part_number = 1
+        parts = []
 
-        if not upload_uuid:
-            # Inizio di un nuovo upload
-            upload_uuid = str(uuid.uuid4())
+        # Leggiamo lo stream della request in chunk
+        chunk_size = 5 * 1024 * 1024  # 5 MB come esempio
+        total_bytes_uploaded = 0
 
-            # Inizia multipart upload
-            response = s3_client.create_multipart_upload(
-                Bucket=S3_BUCKET,
-                Key=file_name
+        # Per calcolare la dimensione totale, possiamo tentare di leggere l'header Content-Length,
+        # se presente. Se non c'è, si può aggiornare la percentuale in base ai chunk inviati,
+        # oppure usare un contatore.
+        content_length = request.content_length if request.content_length else 0
+        # Apriamo lo stream in lettura
+        def generate_chunks(file_stream, size):
+            while True:
+                data = file_stream.read(size)
+                if not data:
+                    break
+                yield data
+
+        for chunk in generate_chunks(request.stream, chunk_size):
+            # Carichiamo la parte su S3
+            part_upload = s3_client.upload_part(
+                Bucket=S3_BUCKET_NAME,
+                Key=f'upload_{upload_uuid}',
+                PartNumber=part_number,
+                UploadId=upload_id,
+                Body=io.BytesIO(chunk)
             )
-            upload_id = response['UploadId']
+            parts.append({
+                'PartNumber': part_number,
+                'ETag': part_upload['ETag']
+            })
 
-            # Salva sessione in memoria
-            upload_sessions[upload_uuid] = {
-                'upload_id': upload_id,
-                'file_name': file_name,
-                'file_size': file_size,
-                'uploaded_bytes': 0,
-                'parts': {}
-            }
+            total_bytes_uploaded += len(chunk)
+            part_number += 1
 
-            save_log(f"[100] upload_sessions = {upload_sessions}")  # DEBUG
+            # Calcolo percentuale approssimativa
+            percentage = 0
+            if content_length > 0:
+                percentage = int(math.floor((total_bytes_uploaded / content_length) * 100))
+                if percentage > 100:
+                    percentage = 100
 
-            # Inserisci record nel database
-            conn = get_db_connection()
-            with conn.cursor() as cursor:
-                sql = """
-                    INSERT INTO s3_progress (upload_uuid, prg_status, progress)
-                    VALUES (%s, %s, %s)
-                """
-                cursor.execute(sql, (upload_uuid, 'PROGRESS', 0))
-            conn.close()
-        else:
-            # Recupera sessione esistente
-            if upload_uuid not in upload_sessions:
-                return jsonify({'error': f"Upload UUID '{upload_uuid}' (upload_sessions = {upload_sessions}) non valido"}), 400
-            upload_id = upload_sessions[upload_uuid]['upload_id']
-
-        # Carica la parte su S3
-        response = s3_client.upload_part(
-            Bucket=S3_BUCKET,
-            Key=file_name,
-            PartNumber=part_number,
-            UploadId=upload_id,
-            Body=file_part.stream
-        )
-        etag = response['ETag']
-
-        # Aggiorna sessione in memoria
-        session = upload_sessions[upload_uuid]
-
-        save_log(f"[200] upload_sessions = {upload_sessions}")  # DEBUG
-        
-        session['parts'][part_number] = etag
-        session['uploaded_bytes'] += len(file_part.read())
-
-        # Calcola progresso
-        if session['file_size'] > 0:
-            progress = int((session['uploaded_bytes'] / session['file_size']) * 100)
-            progress = min(progress, 100)
-        else:
-            progress = 0
-
-        # Aggiorna database
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            sql = """
-                UPDATE s3_progress
+            # Aggiorna DB con la nuova percentuale
+            update_stmt = """
+                UPDATE s3_progress 
                 SET progress = %s
                 WHERE upload_uuid = %s
             """
-            cursor.execute(sql, (progress, upload_uuid))
-        conn.close()
+            cursor.execute(update_stmt, (percentage, upload_uuid))
+            cnx.commit()
 
-        # Verifica se l'upload è completo
-        if session['uploaded_bytes'] >= session['file_size']:
-            # Completa multipart upload
-            parts = [{'ETag': etag, 'PartNumber': num} for num, etag in sorted(session['parts'].items())]
-            s3_client.complete_multipart_upload(
-                Bucket=S3_BUCKET,
-                Key=file_name,
-                UploadId=upload_id,
-                MultipartUpload={'Parts': parts}
-            )
-            # Ottieni URL del file
-            file_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{file_name}"
+        # Una volta terminati i chunk, concludiamo la multi-part upload
+        complete_response = s3_client.complete_multipart_upload(
+            Bucket=S3_BUCKET_NAME,
+            Key=f'upload_{upload_uuid}',
+            UploadId=upload_id,
+            MultipartUpload={'Parts': parts}
+        )
 
-            # Aggiorna database con stato completato
-            conn = get_db_connection()
-            with conn.cursor() as cursor:
-                sql = """
-                    UPDATE s3_progress
-                    SET prg_status = %s, progress = %s, s3_file_url = %s
-                    WHERE upload_uuid = %s
-                """
-                cursor.execute(sql, ('COMPLETED', 100, file_url, upload_uuid))
-            conn.close()
+        # Aggiorna DB: COMPLETED, progress = 100, e salva la URL finale su s3_file_url
+        file_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/upload_{upload_uuid}"
+        update_completed_stmt = """
+            UPDATE s3_progress 
+            SET prg_status = 'COMPLETED', progress = 100, s3_file_url = %s
+            WHERE upload_uuid = %s
+        """
+        cursor.execute(update_completed_stmt, (file_url, upload_uuid))
+        cnx.commit()
 
-            # Rimuovi sessione in memoria
-
-            save_log(f"[300] upload_sessions = {upload_sessions}")  # DEBUG
-            
-            del upload_sessions[upload_uuid]
-
-            save_log(f"[400] upload_sessions = {upload_sessions}")  # DEBUG
-
-        return jsonify({'upload_uuid': upload_uuid}), 200
-
-    except (BotoCoreError, ClientError) as e:
-        # Gestione errori S3
-        if upload_uuid and upload_uuid in upload_sessions:
-            # Aggiorna database con stato di errore
-            conn = get_db_connection()
-            with conn.cursor() as cursor:
-                sql = """
-                    UPDATE s3_progress
-                    SET prg_status = %s, err_code = %s, err_msg = %s
-                    WHERE upload_uuid = %s
-                """
-                cursor.execute(sql, ('ERROR', 500, str(e), upload_uuid))
-            conn.close()
-            del upload_sessions[upload_uuid]
-        return jsonify({'error': str(e)}), 500
     except Exception as e:
-        # Gestione errori generici
-        if upload_uuid and upload_uuid in upload_sessions:
-            conn = get_db_connection()
-            with conn.cursor() as cursor:
-                sql = """
-                    UPDATE s3_progress
-                    SET prg_status = %s, err_code = %s, err_msg = %s
-                    WHERE upload_uuid = %s
-                """
-                cursor.execute(sql, ('ERROR', 500, str(e), upload_uuid))
-            conn.close()
-            del upload_sessions[upload_uuid]
-        return jsonify({'error': str(e)}), 500
+        # Se qualcosa va storto, settiamo lo stato = ERROR
+        error_msg = str(e)
+        update_error_stmt = """
+            UPDATE s3_progress
+            SET prg_status = 'ERROR', err_code = 1, err_msg = %s
+            WHERE upload_uuid = %s
+        """
+        cursor.execute(update_error_stmt, (error_msg, upload_uuid))
+        cnx.commit()
+    finally:
+        cursor.close()
+        cnx.close()
+
+    # Ritorniamo l'UUID (anche se in caso di errore, l'utente saprà di dover riprovare)
+    return jsonify({"upload_uuid": upload_uuid})
+
 
 @app.route('/api/s3progress', methods=['GET'])
 def api_s3progress():
-    upload_uuid = request.args.get('upload_uuid')
+    """
+    Restituisce lo stato di avanzamento (e altri dati) di un upload
+    cercando per upload_uuid nella tabella s3_progress.
+    """
+    upload_uuid = request.args.get('uuid', None)
     if not upload_uuid:
-        return jsonify({'error': 'Parametri mancanti'}), 400
+        return jsonify({"error": "Missing uuid parameter"}), 400
 
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            sql = """
-                SELECT prg_status, progress, err_code, err_msg, s3_file_url
-                FROM s3_progress
-                WHERE upload_uuid = %s
-            """
-            cursor.execute(sql, (upload_uuid,))
-            result = cursor.fetchone()
-        conn.close()
+    cnx = get_db_connection()
+    cursor = cnx.cursor(dictionary=True)
+    select_stmt = """
+        SELECT upload_uuid, prg_status, err_code, err_msg, progress, s3_file_url
+        FROM s3_progress
+        WHERE upload_uuid = %s
+        LIMIT 1
+    """
+    cursor.execute(select_stmt, (upload_uuid,))
+    row = cursor.fetchone()
+    cursor.close()
+    cnx.close()
 
-        if not result:
-            return jsonify({'error': 'Upload UUID non trovato'}), 404
+    if not row:
+        return jsonify({"error": "Upload UUID not found"}), 404
 
-        return jsonify(result), 200
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    return jsonify(row)
 
 @app.route('/')
 def home():    
@@ -279,15 +249,14 @@ def s3upload():
             err = '[' + type(e).__name__ + '] ' + str(e)
         return err, 500
 
-# Connessione al database
 def get_db_connection():
-    return pymysql.connect(
+    """Restituisce una connessione MySQL basata sulle credenziali lette da JSON."""
+    return mysql.connector.connect(
         host=DB_HOST,
+        port=DB_PORT,
         user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME,
-        cursorclass=DictCursor,
-        autocommit=True
+        password=DB_PASS,
+        database=DB_NAME
     )
 
 def save_log(text: str):

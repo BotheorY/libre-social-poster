@@ -13,11 +13,14 @@
     <div class="container mx-auto px-4 py-8 max-w-2xl flex-grow">
         <h1 class="text-3xl font-bold text-center mb-8">S3 Uploader</h1>
         <div class="bg-white rounded-lg shadow-md p-6">
+
+            <!-- Form di Upload -->
             <form id="uploadForm" class="space-y-6">
                 <div class="space-y-2">
                     <label class="block text-sm font-medium text-gray-700">File</label>
                     <div class="space-y-2">
-                        <input type="file" id="fileInput" name="file" class="w-full px-3 py-2 border rounded-md">
+                        <input type="file" name="file" id="fileInput"
+                               class="w-full px-3 py-2 border rounded-md" required>
                     </div>
                 </div>
 
@@ -25,7 +28,6 @@
                 <button type="submit" class="w-full bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
                     INVIA FILE
                 </button>
-
             </form>
 
             <!-- Progress Container -->
@@ -35,10 +37,13 @@
                     <span id="uploadPercentage" class="text-sm font-medium">0%</span>
                 </div>
                 <div class="w-full bg-gray-200 rounded-full h-2.5">
-                    <div id="progressBar" class="bg-blue-600 h-2.5 rounded-full transition-all duration-300" style="width: 0%"></div>
+                    <div id="progressBar" 
+                         class="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
+                         style="width: 0%"></div>
                 </div>
                 <!-- Clear Button -->
-                <button style="margin-top: 1em;" id="clearBtn" onclick="clearPage();" type="button" class="hidden w-full bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
+                <button style="margin-top: 1em;" id="clearBtn" onclick="clearPage();"
+                        type="button" class="hidden w-full bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
                     Nuovo upload
                 </button>
             </div>
@@ -66,118 +71,113 @@
     </footer>
 
     <script>
+        // Al caricamento, controlliamo se c'è un uuid nei parametri
+        document.addEventListener('DOMContentLoaded', () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const uuid = urlParams.get('uuid');
 
-        const uploadForm = document.getElementById('uploadForm');
-        const uploadProgress = document.getElementById('uploadProgress');
-        const progressBar = document.getElementById('progressBar');
-        const uploadStatus = document.getElementById('uploadStatus');
-        const uploadPercentage = document.getElementById('uploadPercentage');
-        const clearBtn = document.getElementById('clearBtn');
-        const fileInput = document.getElementById('fileInput');
-
-        // Dimensione del chunk (5MB)
-        const CHUNK_SIZE = 5 * 1024 * 1024;
-
-        uploadForm.addEventListener('submit', function(e) {
-            e.preventDefault();
-            const file = fileInput.files[0];
-            if (!file) {
-                alert('Seleziona un file da caricare.');
-                return;
+            if (uuid) {
+                // Se c'è l'UUID, nascondiamo il form e mostriamo la progressbar
+                document.getElementById('uploadForm').classList.add('hidden');
+                document.getElementById('uploadProgress').classList.remove('hidden');
+                checkProgress(uuid);
+            } else {
+                // Altrimenti, inizializziamo il form di upload
+                initUploadForm();
             }
-
-            // Nascondi il form e mostra la progress bar
-            uploadForm.classList.add('hidden');
-            uploadProgress.classList.remove('hidden');
-
-            // Inizia l'upload
-            startUpload(file);
         });
 
-        async function startUpload(file) {
-            const totalSize = file.size;
-            let uploadedSize = 0;
-            let partNumber = 1;
-            let uploadUuid = null;
-
-            while (uploadedSize < totalSize) {
-                const chunk = file.slice(uploadedSize, uploadedSize + CHUNK_SIZE);
-                const formData = new FormData();
-                if (uploadUuid) {
-                    formData.append('upload_uuid', uploadUuid);
-                }
-                formData.append('file_part', chunk);
-                formData.append('part_number', partNumber);
-                formData.append('file_name', file.name);
-                if (partNumber === 1) {
-                    formData.append('file_size', totalSize);
-                }
-
-                try {
-                    const response = await fetch('/api/s3send', {
-                        method: 'PUT',
-                        body: formData
-                    });
-
-                    if (!response.ok) {
-                        const errorData = await response.json();
-                        throw new Error(errorData.error || 'Errore durante l\'upload.');
-                    }
-
-                    const data = await response.json();
-                    uploadUuid = data.upload_uuid;
-
-                    // Aggiorna la dimensione caricata
-                    uploadedSize += chunk.size;
-                    const progress = Math.min(Math.floor((uploadedSize / totalSize) * 100), 100);
-                    updateProgress(progress, 'Upload in corso...');
-
-                    partNumber += 1;
-
-                } catch (error) {
-                    updateProgress(0, `Errore: ${error.message}`);
-                    clearBtn.classList.remove('hidden');
+        function initUploadForm() {
+            const form = document.getElementById('uploadForm');
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const fileInput = document.getElementById('fileInput');
+                if (!fileInput.files.length) {
                     return;
                 }
-            }
 
-            // Verifica lo stato finale
-            checkFinalStatus(uploadUuid);
-        }
+                // Nascondiamo il form, mostriamo la progress bar
+                form.classList.add('hidden');
+                const progressContainer = document.getElementById('uploadProgress');
+                progressContainer.classList.remove('hidden');
 
-        async function checkFinalStatus(uploadUuid) {
-            const interval = setInterval(async () => {
+                // Inizio upload
+                document.getElementById('uploadStatus').textContent = 'Inizio upload...';
+
                 try {
-                    const response = await fetch(`/api/s3progress?upload_uuid=${uploadUuid}`);
+                    // Leggiamo il file come Blob e lo inviamo via fetch con metodo PUT
+                    const file = fileInput.files[0];
+                    const response = await fetch('/api/s3send', {
+                        method: 'PUT',
+                        headers: {
+                            'Content-Type': 'application/octet-stream',
+                            'X-File-Name': encodeURIComponent(file.name)
+                        },
+                        body: file
+                    });
                     if (!response.ok) {
-                        throw new Error('Errore nel recupero dello stato.');
+                        throw new Error('Errore durante la richiesta PUT');
                     }
-
                     const data = await response.json();
-                    uploadPercentage.textContent = `${data.progress}%`;
-                    progressBar.style.width = `${data.progress}%`;
-
-                    if (data.prg_status === 'COMPLETED') {
-                        uploadStatus.textContent = 'Upload completato con successo!';
-                        clearInterval(interval);
-                        clearBtn.classList.remove('hidden');
-                    } else if (data.prg_status === 'ERROR') {
-                        uploadStatus.textContent = `Errore durante l'upload: ${data.err_msg}`;
-                        clearInterval(interval);
-                        clearBtn.classList.remove('hidden');
+                    if (data.upload_uuid) {
+                        // Una volta ottenuto l'UUID, facciamo redirect su ?uuid=...
+                        window.location.href = '?uuid=' + data.upload_uuid;
+                    } else {
+                        throw new Error('upload_uuid non presente nella risposta');
                     }
                 } catch (error) {
-                    uploadStatus.textContent = `Errore: ${error.message}`;
-                    clearInterval(interval);
-                    clearBtn.classList.remove('hidden');
+                    console.error(error);
+                    // Mostriamo errore e il pulsante di reset
+                    document.getElementById('uploadStatus').textContent = 'Errore upload!';
+                    document.getElementById('clearBtn').classList.remove('hidden');
                 }
-            }, 2000); // Aggiorna ogni 2 secondi
+            });
         }
 
-        function updateProgress(percentage, status) {
-            uploadPercentage.textContent = `${percentage}%`;
-            progressBar.style.width = `${percentage}%`;
-            uploadStatus.textContent = status;
+        async function checkProgress(uuid) {
+            // Polling finchè prg_status = PROGRESS
+            // Se COMPLETED o ERROR, mostriamo il pulsante clearBtn
+            try {
+                const response = await fetch('/api/s3progress?uuid=' + uuid);
+                if (!response.ok) {
+                    throw new Error('Errore nella richiesta s3progress');
+                }
+                const data = await response.json();
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                // Aggiorna progress bar
+                const prg_status = data.prg_status;
+                const percentage = data.progress || 0;
+
+                document.getElementById('uploadStatus').textContent = 'Stato: ' + prg_status;
+                document.getElementById('uploadPercentage').textContent = percentage + '%';
+                document.getElementById('progressBar').style.width = percentage + '%';
+
+                if (prg_status === 'PROGRESS') {
+                    // Continuiamo a fare redirect GET, ricaricando la pagina e ripetendo
+                    // (per simulare il "loop" indicato nella specifica).
+                    // Oppure potremmo semplicemente fare setTimeout(checkProgress, 1000, uuid).
+                    window.location.href = '?uuid=' + uuid;
+                } else {
+                    // COMPLETED o ERROR
+                    document.getElementById('clearBtn').classList.remove('hidden');
+
+                    if (prg_status === 'COMPLETED') {
+                        // Magari mostriamo un messaggio di successo
+                        document.getElementById('uploadStatus').textContent = 'Upload completato!';
+                    } else {
+                        // ERROR
+                        document.getElementById('uploadStatus').textContent = 'Errore: ' + (data.err_msg || '');
+                    }
+                }
+
+            } catch (error) {
+                console.error(error);
+                document.getElementById('uploadStatus').textContent = 'Errore nel recupero progress!';
+                document.getElementById('clearBtn').classList.remove('hidden');
+            }
         }
 
         function clearPage() {
@@ -185,16 +185,19 @@
             const statusText = document.getElementById('uploadStatus');
             const percentageText = document.getElementById('uploadPercentage');
             const progressContainer = document.getElementById('uploadProgress');
-            const progressBar = document.querySelector('#uploadProgress div div');
+            const progressBar = document.getElementById('progressBar');
+
             document.getElementById('clearBtn').classList.add('hidden');
             form.reset();
             form.classList.remove('hidden');
             progressContainer.classList.add('hidden');
             statusText.textContent = 'Preparazione upload...';
             progressBar.style.width = '0%';
-            percentageText.textContent = '0%';            
-        }
+            percentageText.textContent = '0%';
 
+            // Rimuoviamo il parametro uuid dalla URL ricaricando la pagina senza query
+            window.history.replaceState({}, document.title, window.location.pathname);
+        }
     </script>
 
 </body>
