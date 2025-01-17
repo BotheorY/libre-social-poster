@@ -1,0 +1,55 @@
+<!-- templates/process.html -->
+{% extends "ytpub.html" %}
+{% block content %}
+<div class="progress-container">
+    {% if error %}
+        <div class="alert alert-danger" role="alert">
+            Si è verificato un errore: {{ error }}
+        </div>
+        <a href="{{ url_for('ytpub') }}" class="btn btn-primary mt-3">
+            Carica un nuovo video
+        </a>
+    {% elif state == 'init_complete' %}
+        <h4 class="mb-4">Inizializzazione upload del video</h4>
+        <div class="progress mb-4">
+            <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                 role="progressbar" 
+                 style="width: 33%">
+                33%
+            </div>
+        </div>
+        <p>Preparazione del video in corso...</p>
+    {% elif state == 'complete' %}
+        <h4 class="mb-4">Video pubblicato con successo su YouTube</h4>
+        <div class="progress mb-4">
+            <div class="progress-bar bg-success" 
+                 role="progressbar" 
+                 style="width: 100%">
+                100%
+            </div>
+        </div>
+        <p>Video pubblicato con ID: {{ video_id }}</p>
+        <a href="{{ url_for('ytpub') }}" class="btn btn-primary mt-3">
+            Carica un nuovo video
+        </a>
+    {% else %}
+        <h4 class="mb-4">Pubblicazione del video</h4>
+        <div class="progress mb-4">
+            <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                 role="progressbar" 
+                 style="width: 66%">
+                66%
+            </div>
+        </div>
+        <p>Upload su YouTube in corso...</p>
+    {% endif %}
+</div>
+
+{% if state != 'complete' and not error %}
+<script>
+    setTimeout(() => {
+        window.location.reload();
+    }, 2000);
+</script>
+{% endif %}
+{% endblock %}

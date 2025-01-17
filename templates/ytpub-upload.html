@@ -1,0 +1,311 @@
+<!-- templates/upload.html -->
+{% extends "ytpub.html" %}
+{% block content %}
+<div class="d-flex justify-content-end mt-3">
+    <a href="{{ url_for('yt_logout') }}" class="btn btn-outline-danger">Disconnetti</a>
+</div>
+
+<form id="uploadForm" class="upload-form" onsubmit="return false;">
+    <h2 class="mb-4">Pubblicazione video su YouTube</h2>
+    
+    <!-- Video Source -->
+    <div class="source-group">
+        <h5>Video</h5>
+        <div class="mb-3">
+            <div class="form-check">
+                <input class="form-check-input" type="radio" name="video_source" id="video_file" value="file" checked>
+                <label class="form-check-label" for="video_file">
+                    Carica file
+                </label>
+            </div>
+            <div class="mb-3 ms-4" id="video_file_input">
+                <input type="file" class="form-control" name="video" id="video" accept="video/*">
+            </div>
+            
+            <div class="form-check">
+                <input class="form-check-input" type="radio" name="video_source" id="video_url" value="url">
+                <label class="form-check-label" for="video_url">
+                    URL video
+                </label>
+            </div>
+            <div class="mb-3 ms-4" id="video_url_input" style="display: none;">
+                <input type="url" class="form-control" name="video_url" id="video_url_field" placeholder="https://...">
+            </div>
+        </div>
+    </div>
+
+    <!-- Thumbnail -->
+    <div class="source-group">
+        <h5>Thumbnail (opzionale)</h5>
+        <div class="mb-3">
+            <div class="form-check">
+                <input class="form-check-input" type="radio" name="thumbnail_source" id="no_thumbnail" value="none" checked>
+                <label class="form-check-label" for="no_thumbnail">
+                    Nessuna thumbnail
+                </label>
+            </div>
+            
+            <div class="form-check">
+                <input class="form-check-input" type="radio" name="thumbnail_source" id="thumbnail_file" value="file">
+                <label class="form-check-label" for="thumbnail_file">
+                    Carica file
+                </label>
+            </div>
+            <div class="mb-3 ms-4" id="thumbnail_file_input" style="display: none;">
+                <input type="file" class="form-control" name="thumbnail" id="thumbnail" accept="image/*">
+            </div>
+            
+            <div class="form-check">
+                <input class="form-check-input" type="radio" name="thumbnail_source" id="thumbnail_url" value="url">
+                <label class="form-check-label" for="thumbnail_url">
+                    URL immagine
+                </label>
+            </div>
+            <div class="mb-3 ms-4" id="thumbnail_url_input" style="display: none;">
+                <input type="url" class="form-control" name="thumbnail_url" id="thumbnail_url_field" placeholder="https://...">
+            </div>
+        </div>
+    </div>
+
+    <!-- Metadata -->
+    <div class="source-group">
+        <h5>Metadati</h5>
+        <div class="mb-3">
+            <label for="title" class="form-label">Titolo *</label>
+            <input type="text" class="form-control" id="title" name="title" required>
+        </div>
+        
+        <div class="mb-3">
+            <label for="description" class="form-label">Descrizione</label>
+            <textarea class="form-control" id="description" name="description" rows="3"></textarea>
+        </div>
+        
+        <div class="mb-3">
+            <label for="tags" class="form-label">Tag (separati da virgola)</label>
+            <input type="text" class="form-control" id="tags" name="tags" placeholder="tag1, tag2, tag3">
+        </div>
+        
+        <div class="mb-3">
+            <label for="category" class="form-label">Categoria *</label>
+            <select class="form-select" id="category" name="category" required>
+                {% for category in categories %}
+                <option value="{{ category['id'] }}">{{ category['title'] }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        
+        <div class="mb-3">
+            <label for="privacy" class="form-label">Visibilità *</label>
+            <select class="form-select" id="privacy" name="privacy" required>
+                <option value="public">Pubblico</option>
+                <option value="unlisted">Non in elenco</option>
+                <option value="private">Privato</option>
+            </select>
+        </div>
+    </div>
+
+    <!-- Progress Bar -->
+    <div class="progress mb-3" style="display: none;" id="uploadProgress">
+        <div class="progress-bar progress-bar-striped progress-bar-animated" 
+             role="progressbar" 
+             style="width: 0%">
+            0%
+        </div>
+    </div>
+    <p id="uploadStatus" class="text-center" style="display: none;"></p>
+
+    <button type="button" class="btn btn-primary" id="startUploadBtn" onclick="startUpload()">Inizia pubblicazione</button>
+</form>
+
+<script>
+// Configurazione per l'upload a chunk
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB per chunk
+
+async function uploadChunk(chunk, params) {
+    const formData = new FormData();
+    formData.append('chunk', chunk);
+    for (let key in params) {
+        formData.append(key, params[key]);
+    }
+
+    const response = await fetch('/ytupload/chunk', {
+        method: 'POST',
+        body: formData
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    return await response.json();
+}
+
+async function handleFileUpload(file, upload_id) {
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    let uploadedChunks = 0;
+
+    for (let chunkNumber = 0; chunkNumber < totalChunks; chunkNumber++) {
+        const start = chunkNumber * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const chunk = file.slice(start, end);
+
+        const params = {
+            chunk_number: chunkNumber,
+            total_chunks: totalChunks,
+            upload_id: upload_id,
+            original_filename: file.name
+        };
+
+        // Aggiungiamo i metadati solo nell'ultimo chunk
+        if (chunkNumber === totalChunks - 1) {
+            params.title = document.getElementById('title').value;
+            params.description = document.getElementById('description').value;
+            params.tags = document.getElementById('tags').value;
+            params.category = document.getElementById('category').value;
+            params.privacy = document.getElementById('privacy').value;
+        }
+
+        try {
+            const result = await uploadChunk(chunk, params);
+            uploadedChunks++;
+            updateProgress(uploadedChunks, totalChunks);
+
+            if (result.redirect) {
+                window.location.href = result.redirect;
+                return;
+            }
+        } catch (error) {
+            throw new Error(`Error uploading chunk ${chunkNumber}: ${error.message}`);
+        }
+    }
+}
+
+async function handleUrlUpload(url, upload_id) {
+    const formData = new FormData();
+    formData.append('video_url', url);
+    formData.append('upload_id', upload_id);
+    formData.append('title', document.getElementById('title').value);
+    formData.append('description', document.getElementById('description').value);
+    formData.append('tags', document.getElementById('tags').value);
+    formData.append('category', document.getElementById('category').value);
+    formData.append('privacy', document.getElementById('privacy').value);
+
+    const response = await fetch('/ytupload/url', {
+        method: 'POST',
+        body: formData
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const result = await response.json();
+    if (result.redirect) {
+        window.location.href = result.redirect;
+    }
+}
+
+function updateProgress(uploadedChunks, totalChunks) {
+    const progress = (uploadedChunks / totalChunks) * 100;
+    const progressBar = document.querySelector('#uploadProgress .progress-bar');
+    progressBar.style.width = progress + '%';
+    progressBar.textContent = Math.round(progress) + '%';
+    document.getElementById('uploadStatus').textContent = 
+        `Uploading chunk ${uploadedChunks}/${totalChunks}`;
+}
+
+async function uploadThumbnail(upload_id) {
+    const thumbnailSource = document.querySelector('input[name="thumbnail_source"]:checked').value;
+    if (thumbnailSource === 'none') return;
+
+    const formData = new FormData();
+    formData.append('upload_id', upload_id);
+
+    if (thumbnailSource === 'file') {
+        const thumbnailFile = document.getElementById('thumbnail').files[0];
+        if (thumbnailFile) {
+            formData.append('thumbnail', thumbnailFile);
+        }
+    } else if (thumbnailSource === 'url') {
+        const thumbnailUrl = document.getElementById('thumbnail_url_field').value;
+        if (thumbnailUrl) {
+            formData.append('thumbnail_url', thumbnailUrl);
+        }
+    }
+
+    const response = await fetch('/ytupload/thumbnail', {
+        method: 'POST',
+        body: formData
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+    }
+}
+
+async function startUpload() {
+    const form = document.getElementById('uploadForm');
+    const progressDiv = document.getElementById('uploadProgress');
+    const statusText = document.getElementById('uploadStatus');
+    const uploadButton = document.getElementById('startUploadBtn');
+
+    if (!form.checkValidity()) {
+        form.reportValidity();
+        return;
+    }
+
+    progressDiv.style.display = 'block';
+    statusText.style.display = 'block';
+    uploadButton.disabled = true;
+
+    const upload_id = crypto.randomUUID();
+    const videoSource = document.querySelector('input[name="video_source"]:checked').value;
+
+    try {
+        if (videoSource === 'file') {
+            const videoFile = document.getElementById('video').files[0];
+            if (!videoFile) {
+                throw new Error('Seleziona un file video');
+            }
+            await handleFileUpload(videoFile, upload_id);
+        } else if (videoSource === 'url') {
+            const videoUrl = document.getElementById('video_url_field').value;
+            if (!videoUrl) {
+                throw new Error('Inserisci un URL valido');
+            }
+            await handleUrlUpload(videoUrl, upload_id);
+        }
+
+        await uploadThumbnail(upload_id);
+
+    } catch (error) {
+        console.error('Upload error:', error);
+        statusText.textContent = `Errore durante l'upload: ${error.message}`;
+        const progressBar = document.querySelector('#uploadProgress .progress-bar');
+        progressBar.classList.remove('progress-bar-animated');
+        progressBar.classList.add('bg-danger');
+        uploadButton.disabled = false;
+    }
+}
+
+// Gestione della visibilità dei campi input video
+document.querySelectorAll('input[name="video_source"]').forEach(input => {
+    input.addEventListener('change', (e) => {
+        document.getElementById('video_file_input').style.display = 
+            e.target.value === 'file' ? 'block' : 'none';
+        document.getElementById('video_url_input').style.display = 
+            e.target.value === 'url' ? 'block' : 'none';
+    });
+});
+
+// Gestione della visibilità dei campi input thumbnail
+document.querySelectorAll('input[name="thumbnail_source"]').forEach(input => {
+    input.addEventListener('change', (e) => {
+        document.getElementById('thumbnail_file_input').style.display = 
+            e.target.value === 'file' ? 'block' : 'none';
+        document.getElementById('thumbnail_url_input').style.display = 
+            e.target.value === 'url' ? 'block' : 'none';
+    });
+});
+</script>
+{% endblock %}
