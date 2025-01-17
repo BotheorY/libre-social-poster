@@ -46,13 +46,6 @@ YT_SCOPES = ['https://www.googleapis.com/auth/youtube.upload', 'https://www.goog
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
-def yt_get_oauth_flow():
-    return Flow.from_client_secrets_file(
-        YT_CLIENT_SECRETS_FILE,
-        scopes=YT_SCOPES,
-        redirect_uri=url_for('yt_oauth2callback', _external=True)
-    )
-
 @app.route('/ytpub')
 @app.route('/ytpub/')
 def ytpub():
@@ -122,110 +115,6 @@ def yt_logout():
         logger.error(f"Errore durante la revoca: {str(e)}")
         return f'Errore durante la revoca: {str(e)}', 500
 
-def yt_handle_thumbnail_upload(upload_id, thumb_file):
-    """Gestisce il salvataggio della thumbnail"""
-    try:
-        if thumb_file:
-            extension = os.path.splitext(thumb_file.filename)[1]
-            thumb_path = os.path.join(UPLOAD_FOLDER, f"thumb_{upload_id}{extension}")
-            thumb_file.save(thumb_path)
-            return True
-    except Exception as e:
-        logger.error(f"Errore durante il salvataggio della thumbnail: {str(e)}")
-        return False
-
-def download_file(url, temp_path):
-    """Scarica un file da un URL"""
-    try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        with open(temp_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        return True
-    except Exception as e:
-        logger.error(f"Errore durante il download del file: {str(e)}")
-        return False
-
-# Funzioni di utilità per la gestione dei metadati
-def yt_save_metadata(upload_id, metadata):
-    """Salva i metadati del video nella sessione"""
-    session[f'metadata_{upload_id}'] = {
-        'title': metadata.get('title'),
-        'description': metadata.get('description'),
-        'tags': metadata.get('tags', '').split(',') if metadata.get('tags') else None,
-        'category': metadata.get('category'),
-        'privacy': metadata.get('privacy')
-    }
-
-def download_and_chunk_file(url, upload_id):
-    try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        filename = os.path.basename(urlparse(url).path)
-        extension = os.path.splitext(filename)[1]
-        chunk_number = 0
-        
-        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-            chunk_filename = f"{upload_id}_{chunk_number}{extension}"
-            chunk_path = os.path.join(UPLOAD_FOLDER, chunk_filename)
-            
-            with open(chunk_path, 'wb') as f:
-                f.write(chunk)
-            chunk_number += 1
-            
-#        return True, chunk_number
-        return True
-    except Exception as e:
-        logger.error(f"Errore durante il download del file: {str(e)}")
-#        return False, str(e)
-        return False
-
-def remove_chunks(upload_id):
-    # Pulizia dei file temporanei
-    for filename in os.listdir(UPLOAD_FOLDER):
-        if filename.startswith(upload_id) or filename.startswith(f"thumb_{upload_id}"):
-            try:
-                os.remove(os.path.join(UPLOAD_FOLDER, filename))
-            except Exception as e:
-                logger.error(f"Errore durante la rimozione del file {filename}: {str(e)}")
-
-def _unisci_chunk(upload_id):
-    prefisso = f"{upload_id}_"
-    # Trova tutti i file chunk che iniziano con il prefisso corretto
-    chunk_files = []
-    for nome_file in os.listdir(UPLOAD_FOLDER):
-        if nome_file.startswith(prefisso):
-            # Estrae la parte rimanente dopo il prefisso: {chunk_number}{extension}
-            resto = nome_file[len(prefisso):]
-            # Separa la parte numerica dall'estensione
-            numero_str, estensione = os.path.splitext(resto)
-            try:
-                numero_chunk = int(numero_str)
-            except ValueError:
-                # Se la parte numerica non è valida, ignora questo file
-                continue
-            chunk_files.append((numero_chunk, nome_file, estensione))        
-    # Se non ci sono chunk da unire, esci
-    if not chunk_files:
-        return None
-    # Ordina i chunk in base al numero
-    chunk_files.sort(key=lambda x: x[0])
-    # Usa l'estensione del primo chunk per costruire il nome del file finale
-    _, primo_chunk, estensione = chunk_files[0]
-    nome_file_finale = f"{upload_id}{estensione}"
-    percorso_file_finale = os.path.join(BASE_DIR, nome_file_finale)
-    # Unisci i chunk nel file finale
-    with open(percorso_file_finale, "wb") as outfile:
-        for _, nome_chunk, _ in chunk_files:
-            percorso_chunk = os.path.join(UPLOAD_FOLDER, nome_chunk)
-            with open(percorso_chunk, "rb") as infile:
-                # Legge e scrive il contenuto del chunk nel file finale
-                outfile.write(infile.read())
-
 @app.route('/ytupload/chunk', methods=['POST'])
 def yt_upload_chunk():
     """
@@ -281,7 +170,6 @@ def yt_upload_url():
             
         temp_path = os.path.join(UPLOAD_FOLDER, f"{upload_id}_0{extension}")
         
-#        if not download_file(video_url, temp_path):
         if not download_and_chunk_file(video_url, upload_id):
             return jsonify({'error': 'Errore durante il download del video'}), 500
             
@@ -333,8 +221,6 @@ def yt_process_upload(upload_id):
 
     if 'credentials' not in session:
         return redirect(url_for('ytpub'))
-
-    # unisci_chunk(upload_id) # DEBUG
 
     state = request.args.get('state')
     error = request.args.get('error')
@@ -442,6 +328,13 @@ def yt_process_upload(upload_id):
                          state=state,
                          upload_id=upload_id)
 
+def yt_get_oauth_flow():
+    return Flow.from_client_secrets_file(
+        YT_CLIENT_SECRETS_FILE,
+        scopes=YT_SCOPES,
+        redirect_uri=url_for('yt_oauth2callback', _external=True)
+    )
+
 def yt_categories(youtube):
     """
     Recupera la lista delle categorie video disponibili da YouTube.
@@ -496,7 +389,73 @@ def yt_categories(youtube):
             {'id': '28', 'title': 'Science & Technology'},
             {'id': '29', 'title': 'Nonprofits & Activism'}
         ] 
-    
+
+def yt_handle_thumbnail_upload(upload_id, thumb_file):
+    """Gestisce il salvataggio della thumbnail"""
+    try:
+        if thumb_file:
+            extension = os.path.splitext(thumb_file.filename)[1]
+            thumb_path = os.path.join(UPLOAD_FOLDER, f"thumb_{upload_id}{extension}")
+            thumb_file.save(thumb_path)
+            return True
+    except Exception as e:
+        logger.error(f"Errore durante il salvataggio della thumbnail: {str(e)}")
+        return False
+
+def yt_save_metadata(upload_id, metadata):
+    """Salva i metadati del video nella sessione"""
+    session[f'metadata_{upload_id}'] = {
+        'title': metadata.get('title'),
+        'description': metadata.get('description'),
+        'tags': metadata.get('tags', '').split(',') if metadata.get('tags') else None,
+        'category': metadata.get('category'),
+        'privacy': metadata.get('privacy')
+    }
+
+def download_and_chunk_file(url, upload_id):
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        filename = os.path.basename(urlparse(url).path)
+        extension = os.path.splitext(filename)[1]
+        chunk_number = 0
+        
+        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+            chunk_filename = f"{upload_id}_{chunk_number}{extension}"
+            chunk_path = os.path.join(UPLOAD_FOLDER, chunk_filename)
+            
+            with open(chunk_path, 'wb') as f:
+                f.write(chunk)
+            chunk_number += 1
+        return True
+    except Exception as e:
+        logger.error(f"Errore durante il download del file: {str(e)}")
+        return False
+
+def download_file(url, temp_path):
+    """Scarica un file da un URL"""
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        with open(temp_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        return True
+    except Exception as e:
+        logger.error(f"Errore durante il download del file: {str(e)}")
+        return False
+
+def remove_chunks(upload_id):
+    # Pulizia dei file temporanei
+    for filename in os.listdir(UPLOAD_FOLDER):
+        if filename.startswith(upload_id) or filename.startswith(f"thumb_{upload_id}"):
+            try:
+                os.remove(os.path.join(UPLOAD_FOLDER, filename))
+            except Exception as e:
+                logger.error(f"Errore durante la rimozione del file {filename}: {str(e)}")    
 class ChunkedFile(io.RawIOBase):
     def __init__(self, upload_id):
         self.base_dir = UPLOAD_FOLDER
