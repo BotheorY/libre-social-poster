@@ -1,10 +1,11 @@
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from flask import Flask, Response, render_template, request, redirect, url_for, session, jsonify
 import logging
 import os
 import requests
 from urllib.parse import urlparse
 import io
 import json
+import time
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -39,6 +40,275 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def json_sfile_to_obj(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            return json.load(file)
+    except FileNotFoundError:
+        raise Exception(f"Errore leggendo il file JSON {file_path}: file non trovato")
+    except json.JSONDecodeError:
+        raise Exception(f"Errore nella decodifica del JSON leggendo il file {file_path}")
+    except Exception as e:
+        raise Exception(f"Errore leggendo il file JSON {file_path}: {e}")     
+    
+@app.route('/robots.txt')
+@app.route('/robots.txt/')
+def robots():
+    return Response("User-agent: *\nDisallow: /\n", mimetype='text/plain')
+
+##################################################################################
+# TIKTOK ->
+##################################################################################
+
+# Configurazione TikTok
+TIK_CLIENT_SECRETS_FILE = os.path.join(BASE_DIR, 'tik_client_secrets.json')
+tik_credentials = json_sfile_to_obj(TIK_CLIENT_SECRETS_FILE)
+TIKTOK_CLIENT_KEY = tik_credentials['client_key']
+TIKTOK_CLIENT_SECRET = tik_credentials['client_secret']
+TIKTOK_AUTH_URL = 'https://open-api.tiktok.com/platform/oauth/connect/'
+TIKTOK_TOKEN_URL = 'https://open-api.tiktok.com/oauth/access_token/'
+TIKTOK_REFRESH_URL = 'https://open-api.tiktok.com/oauth/refresh_token/'
+TIKTOK_UPLOAD_URL = 'https://open-api.tiktok.com/share/video/upload/'
+
+@app.route('/tikpub')
+@app.route('/tikpub/')
+def tikpub():
+    if 'tiktok_access_token' not in session:
+        return render_template('tikpub-login.html')
+    return render_template('tikpub-upload.html')
+
+@app.route('/tikauthorize')
+def tik_authorize():
+    csrf_state = os.urandom(16).hex()
+    session['csrf_state'] = csrf_state
+    
+    auth_params = {
+        'client_key': TIKTOK_CLIENT_KEY,
+        'response_type': 'code',
+        'scope': 'video.upload',
+        'redirect_uri': url_for('tik_oauth2callback', _external=True),
+        'state': csrf_state
+    }
+    
+    authorization_url = f"{TIKTOK_AUTH_URL}?{'&'.join(f'{k}={v}' for k, v in auth_params.items())}"
+    return redirect(authorization_url)
+
+@app.route('/tikoauth2callback')
+def tik_oauth2callback():
+    try:
+        if request.args.get('state') != session.get('csrf_state'):
+            raise ValueError("CSRF state mismatch")
+            
+        code = request.args.get('code')
+        if not code:
+            raise ValueError("No authorization code received")
+            
+        # Exchange code for access token
+        token_data = {
+            'client_key': TIKTOK_CLIENT_KEY,
+            'client_secret': TIKTOK_CLIENT_SECRET,
+            'code': code,
+            'grant_type': 'authorization_code'
+        }
+        
+        response = requests.post(TIKTOK_TOKEN_URL, data=token_data)
+        token_info = response.json()
+        
+        if 'access_token' not in token_info:
+            raise ValueError("Failed to obtain access token")
+            
+        session['tiktok_access_token'] = token_info['access_token']
+        session['tiktok_refresh_token'] = token_info.get('refresh_token')
+        session['tiktok_token_expires'] = time.time() + token_info.get('expires_in', 86400)
+        
+    except Exception as e:
+        logger.error(f"Error during TikTok authentication: {e}")
+        session.pop('tiktok_access_token', None)
+        session.pop('tiktok_refresh_token', None)
+        session.pop('tiktok_token_expires', None)
+        
+    return redirect(url_for('tikpub'))
+
+@app.route('/tiklogout')
+def tik_logout():
+    session.pop('tiktok_access_token', None)
+    session.pop('tiktok_refresh_token', None)
+    session.pop('tiktok_token_expires', None)
+    return redirect(url_for('tikpub'))
+
+@app.route('/tikupload/chunk', methods=['POST'])
+def tik_upload_chunk():
+    try:
+        chunk = request.files.get('chunk')
+        chunk_number = request.form.get('chunk_number')
+        total_chunks = request.form.get('total_chunks')
+        upload_id = request.form.get('upload_id')
+        original_filename = request.form.get('original_filename')
+        
+        if not all([chunk, chunk_number, total_chunks, upload_id, original_filename]):
+            return jsonify({'error': 'Missing parameters'}), 400
+            
+        extension = os.path.splitext(original_filename)[1]
+        chunk_filename = f"{upload_id}_{chunk_number}{extension}"
+        chunk_path = os.path.join(UPLOAD_FOLDER, chunk_filename)
+        
+        chunk.save(chunk_path)
+        
+        if int(chunk_number) == int(total_chunks) - 1:
+            tik_save_metadata(upload_id, request.form)
+            return jsonify({
+                'success': True,
+                'message': 'Upload complete',
+                'redirect': url_for('tik_process_upload', upload_id=upload_id, state='init_complete')
+            })
+            
+        return jsonify({'success': True, 'message': 'Chunk received'})
+        
+    except Exception as e:
+        logger.error(f"Error in chunk upload: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/tikprocess/<upload_id>')
+def tik_process_upload(upload_id):
+    if 'tiktok_access_token' not in session:
+        return redirect(url_for('tikpub'))
+
+    state = request.args.get('state')
+    error = request.args.get('error')
+    
+    if error:
+        remove_chunks(upload_id)
+        return render_template('tikpub-process.html', 
+                             error=error,
+                             upload_id=upload_id)
+    
+    if state == 'init_complete':
+        try:
+            # Ensure token is fresh
+            refresh_tiktok_token_if_needed()
+            
+            # Get metadata
+            metadata_key = f'metadata_{upload_id}'
+            if metadata_key not in session:
+                raise Exception("Metadata not found for this upload")
+                
+            metadata = session[metadata_key]
+            
+            # Combine all chunks into a single file
+            final_path = os.path.join(UPLOAD_FOLDER, f"final_{upload_id}.mp4")
+            combine_chunks(upload_id, final_path)
+            
+            # Upload to TikTok
+            with open(final_path, 'rb') as video_file:
+                headers = {
+                    'Authorization': f"Bearer {session['tiktok_access_token']}"
+                }
+                
+                # First, request an upload URL
+                upload_params = {
+                    'open_id': session.get('tiktok_open_id'),
+                    'access_token': session['tiktok_access_token']
+                }
+                
+                upload_url_response = requests.post(
+                    TIKTOK_UPLOAD_URL,
+                    params=upload_params
+                ).json()
+                
+                if 'upload_url' not in upload_url_response:
+                    raise Exception("Failed to get upload URL from TikTok")
+                
+                # Then upload the video
+                files = {
+                    'video': ('video.mp4', video_file, 'video/mp4')
+                }
+                
+                upload_response = requests.post(
+                    upload_url_response['upload_url'],
+                    files=files,
+                    headers=headers
+                ).json()
+                
+                if upload_response.get('error_code', 0) != 0:
+                    raise Exception(f"TikTok upload failed: {upload_response.get('description')}")
+                
+            # Clean up
+            remove_chunks(upload_id)
+            os.remove(final_path)
+            session.pop(metadata_key, None)
+            
+            return redirect(url_for('tik_process_upload',
+                                  upload_id=upload_id,
+                                  state='complete'))
+                                  
+        except Exception as e:
+            logger.error(f"Error during TikTok upload: {e}")
+            remove_chunks(upload_id)
+            return redirect(url_for('tik_process_upload',
+                                  upload_id=upload_id,
+                                  error=str(e)))
+    
+    elif state == 'complete':
+        return render_template('tikpub-process.html',
+                             state='complete')
+    
+    return render_template('tikpub-process.html',
+                         state=state,
+                         upload_id=upload_id)
+
+@app.route('/tiktokabKGNUGYiZ9K9NrN1U6fFiGVJpOy5y04.txt')
+def tik_verfile():
+    return f"tiktok-developers-site-verification=abKGNUGYiZ9K9NrN1U6fFiGVJpOy5y04"
+
+def refresh_tiktok_token_if_needed():
+    """Refresh TikTok access token if it's close to expiring"""
+    if time.time() >= session.get('tiktok_token_expires', 0) - 300:  # 5 minutes buffer
+        try:
+            refresh_data = {
+                'client_key': TIKTOK_CLIENT_KEY,
+                'client_secret': TIKTOK_CLIENT_SECRET,
+                'grant_type': 'refresh_token',
+                'refresh_token': session['tiktok_refresh_token']
+            }
+            
+            response = requests.post(TIKTOK_REFRESH_URL, data=refresh_data)
+            token_info = response.json()
+            
+            if 'access_token' not in token_info:
+                raise ValueError("Failed to refresh access token")
+                
+            session['tiktok_access_token'] = token_info['access_token']
+            session['tiktok_refresh_token'] = token_info.get('refresh_token')
+            session['tiktok_token_expires'] = time.time() + token_info.get('expires_in', 86400)
+            
+        except Exception as e:
+            logger.error(f"Error refreshing TikTok token: {e}")
+            raise
+
+def tik_save_metadata(upload_id, metadata):
+    """Save video metadata in session"""
+    session[f'metadata_{upload_id}'] = {
+        'title': metadata.get('title'),
+        'description': metadata.get('description'),
+        'privacy': metadata.get('privacy', 'PRIVATE')
+    }
+
+def combine_chunks(upload_id, final_path):
+    """Combine all chunks into a single file"""
+    with open(final_path, 'wb') as outfile:
+        chunk_num = 0
+        while True:
+            chunk_path = os.path.join(UPLOAD_FOLDER, f"{upload_id}_{chunk_num}.mp4")
+            if not os.path.exists(chunk_path):
+                break
+            with open(chunk_path, 'rb') as chunk_file:
+                outfile.write(chunk_file.read())
+            chunk_num += 1
+
+##################################################################################
+# <- TIKTOK
+##################################################################################           
+
 ##################################################################################
 # YOUTUBE ->
 ##################################################################################
@@ -50,7 +320,7 @@ YT_SCOPES = ['https://www.googleapis.com/auth/youtube.upload', 'https://www.goog
 @app.route('/ytpub')
 @app.route('/ytpub/')
 def ytpub():
-    if 'credentials' not in session:
+    if 'YTCredentials' not in session:
         return render_template('ytpub-login.html')
     youtube = yt_refresh_credentials()
     return render_template('ytpub-upload.html', categories=yt_categories(youtube))
@@ -72,7 +342,7 @@ def yt_oauth2callback():
         flow = yt_get_oauth_flow()
         flow.fetch_token(authorization_response=request.url)
         credentials = flow.credentials
-        session['credentials'] = {
+        session['YTCredentials'] = {
             'token': credentials.token,
             'refresh_token': credentials.refresh_token,
             'token_uri': credentials.token_uri,
@@ -81,7 +351,7 @@ def yt_oauth2callback():
             'scopes': credentials.scopes
         }
     except Exception as e:
-        session.pop('credentials', None)
+        session.pop('YTCredentials', None)
         logger.error(f"Errore durante la connessione a YouTube: {e}")
     return redirect(url_for('ytpub'))           
 
@@ -96,9 +366,9 @@ def yt_logout():
 
     try:
         yt_refresh_credentials()    
-        credentials = Credentials(**session['credentials'])
+        credentials = Credentials(**session['YTCredentials'])
 
-        logger.info(f"[300] token = {credentials.token};  refresh_token = {credentials.refresh_token}; session = {session['credentials']}") # DEBUG
+        logger.info(f"[300] token = {credentials.token};  refresh_token = {credentials.refresh_token}; session = {session['YTCredentials']}") # DEBUG
         
         revoke = requests.post(
             'https://oauth2.googleapis.com/revoke',
@@ -109,12 +379,12 @@ def yt_logout():
         status_code = getattr(revoke, 'status_code', 500)
         
         # Rimuovi le credenziali dalla sessione indipendentemente dal risultato
-        session.pop('credentials', None)
+        session.pop('YTCredentials', None)
         
         return redirect(url_for('ytpub'))
             
     except Exception as e:
-        session.pop('credentials', None)
+        session.pop('YTCredentials', None)
         logger.error(f"Errore durante la revoca: {str(e)}")
         return f'Errore durante la revoca: {str(e)}', 500
 
@@ -222,7 +492,7 @@ def yt_upload_thumbnail():
 @app.route('/ytprocess/<upload_id>')
 def yt_process_upload(upload_id):
 
-    if 'credentials' not in session:
+    if 'YTCredentials' not in session:
         return redirect(url_for('ytpub'))
 
     state = request.args.get('state')
@@ -416,20 +686,14 @@ def yt_save_metadata(upload_id, metadata):
 
 def yt_refresh_credentials():    
     # Controllo e rinnovo delle credenziali se necessario
-    if 'credentials' not in session:
+    if 'YTCredentials' not in session:
         logger.error("Credenziali mancati nella sessione")
         raise Exception("Credenziali mancati nella sessione")
-    credentials = Credentials(**session['credentials'])
-
-    logger.info(f"[100] token = {credentials.token};  refresh_token = {credentials.refresh_token}; session = {session['credentials']}") # DEBUG
-
+    credentials = Credentials(**session['YTCredentials'])
     if credentials.expired and credentials.refresh_token:
         try:
-
-            logger.info(f"[200] token = {credentials.token};  refresh_token = {credentials.refresh_token}; session = {session['credentials']}") # DEBUG
-    
             credentials.refresh(ytr())
-            session['credentials'] = {
+            session['YTCredentials'] = {
                 'token': credentials.token,
                 'refresh_token': credentials.refresh_token,
                 'token_uri': credentials.token_uri,
@@ -437,12 +701,9 @@ def yt_refresh_credentials():
                 'client_secret': credentials.client_secret,
                 'scopes': credentials.scopes
             }
-
-            logger.info(f"[200] refresh_token = {credentials.refresh_token}; session = {session['credentials']}") # DEBUG
-
         except Exception as e:
             logger.error(f"Errore nel rinnovo delle credenziali: {e}")
-            session.pop('credentials', None)
+            session.pop('YTCredentials', None)
             return redirect(url_for('ytpub'))
     return build('youtube', 'v3', credentials=credentials, cache_discovery=False)  
 
@@ -493,19 +754,8 @@ def remove_chunks(upload_id):
             try:
                 os.remove(os.path.join(UPLOAD_FOLDER, filename))
             except Exception as e:
-                logger.error(f"Errore durante la rimozione del file {filename}: {str(e)}")    
-
-def json_sfile_2_obj(file_path):
-    try:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            return json.load(file)
-    except FileNotFoundError:
-        raise Exception(f"Errore leggendo il file JSON {file_path}: file non trovato")
-    except json.JSONDecodeError:
-        raise Exception(f"Errore nella decodifica del JSON leggendo il file {file_path}")
-    except Exception as e:
-        raise Exception(f"Errore leggendo il file JSON {file_path}: {e}")
-    
+                logger.error(f"Errore durante la rimozione del file {filename}: {str(e)}")  
+     
 class ChunkedFile(io.RawIOBase):
     def __init__(self, upload_id):
         self.base_dir = UPLOAD_FOLDER
