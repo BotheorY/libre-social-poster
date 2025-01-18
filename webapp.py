@@ -47,17 +47,6 @@ logger = logging.getLogger(__name__)
 YT_CLIENT_SECRETS_FILE = os.path.join(BASE_DIR, 'yt_client_secrets.json')
 YT_SCOPES = ['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube.readonly']
 
-# Creazione cartella upload se non esiste
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
-
-def yt_get_oauth_flow():
-    return Flow.from_client_secrets_file(
-        YT_CLIENT_SECRETS_FILE,
-        scopes=YT_SCOPES,
-        redirect_uri=url_for('yt_oauth2callback', _external=True)
-    )
-
 @app.route('/ytpub')
 @app.route('/ytpub/')
 def ytpub():
@@ -406,6 +395,120 @@ def yt_categories(youtube):
             {'id': '28', 'title': 'Science & Technology'},
             {'id': '29', 'title': 'Nonprofits & Activism'}
         ] 
+
+def yt_handle_thumbnail_upload(upload_id, thumb_file):
+    """Gestisce il salvataggio della thumbnail"""
+    try:
+        if thumb_file:
+            extension = os.path.splitext(thumb_file.filename)[1]
+            thumb_path = os.path.join(UPLOAD_FOLDER, f"thumb_{upload_id}{extension}")
+            thumb_file.save(thumb_path)
+            return True
+    except Exception as e:
+        logger.error(f"Errore durante il salvataggio della thumbnail: {str(e)}")
+        return False
+
+def yt_save_metadata(upload_id, metadata):
+    """Salva i metadati del video nella sessione"""
+    session[f'metadata_{upload_id}'] = {
+        'title': metadata.get('title'),
+        'description': metadata.get('description'),
+        'tags': metadata.get('tags', '').split(',') if metadata.get('tags') else None,
+        'category': metadata.get('category'),
+        'privacy': metadata.get('privacy')
+    }
+
+def yt_refresh_credentials():    
+    # Controllo e rinnovo delle credenziali se necessario
+    if 'credentials' not in session:
+        logger.error("Credenziali mancati nella sessione")
+        raise Exception("Credenziali mancati nella sessione")
+    credentials = Credentials(**session['credentials'])
+
+    logger.info(f"[100] token = {credentials.token};  refresh_token = {credentials.refresh_token}; session = {session['credentials']}") # DEBUG
+
+    if credentials.expired and credentials.refresh_token:
+        try:
+
+            logger.info(f"[200] token = {credentials.token};  refresh_token = {credentials.refresh_token}; session = {session['credentials']}") # DEBUG
+    
+            credentials.refresh(ytr())
+            session['credentials'] = {
+                'token': credentials.token,
+                'refresh_token': credentials.refresh_token,
+                'token_uri': credentials.token_uri,
+                'client_id': credentials.client_id,
+                'client_secret': credentials.client_secret,
+                'scopes': credentials.scopes
+            }
+
+            logger.info(f"[200] refresh_token = {credentials.refresh_token}; session = {session['credentials']}") # DEBUG
+
+        except Exception as e:
+            logger.error(f"Errore nel rinnovo delle credenziali: {e}")
+            session.pop('credentials', None)
+            return redirect(url_for('ytpub'))
+    return build('youtube', 'v3', credentials=credentials, cache_discovery=False)  
+
+##################################################################################
+# <- YOUTUBE
+##################################################################################
+
+def download_and_chunk_file(url, upload_id):
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        filename = os.path.basename(urlparse(url).path)
+        extension = os.path.splitext(filename)[1]
+        chunk_number = 0
+        
+        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+            chunk_filename = f"{upload_id}_{chunk_number}{extension}"
+            chunk_path = os.path.join(UPLOAD_FOLDER, chunk_filename)
+            
+            with open(chunk_path, 'wb') as f:
+                f.write(chunk)
+            chunk_number += 1
+        return True
+    except Exception as e:
+        logger.error(f"Errore durante il download del file: {str(e)}")
+        return False
+
+def download_file(url, temp_path):
+    """Scarica un file da un URL"""
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        with open(temp_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        return True
+    except Exception as e:
+        logger.error(f"Errore durante il download del file: {str(e)}")
+        return False
+
+def remove_chunks(upload_id):
+    # Pulizia dei file temporanei
+    for filename in os.listdir(UPLOAD_FOLDER):
+        if filename.startswith(upload_id) or filename.startswith(f"thumb_{upload_id}"):
+            try:
+                os.remove(os.path.join(UPLOAD_FOLDER, filename))
+            except Exception as e:
+                logger.error(f"Errore durante la rimozione del file {filename}: {str(e)}")    
+
+def json_sfile_2_obj(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            return json.load(file)
+    except FileNotFoundError:
+        raise Exception(f"Errore leggendo il file JSON {file_path}: file non trovato")
+    except json.JSONDecodeError:
+        raise Exception(f"Errore nella decodifica del JSON leggendo il file {file_path}")
+    except Exception as e:
+        raise Exception(f"Errore leggendo il file JSON {file_path}: {e}")
     
 class ChunkedFile(io.RawIOBase):
     def __init__(self, upload_id):
