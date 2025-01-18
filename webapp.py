@@ -111,11 +111,7 @@ def yt_logout():
         # Rimuovi le credenziali dalla sessione indipendentemente dal risultato
         session.pop('credentials', None)
         
-#        if status_code == 200:
         return redirect(url_for('ytpub'))
-#        else:
-#            logger.error(f"Errore nella revoca del token: {revoke.text}")
-#            return f'Errore nella revoca del token: {revoke.text}', status_code
             
     except Exception as e:
         session.pop('credentials', None)
