@@ -28,7 +28,7 @@
                 100%
             </div>
         </div>
-        <p>Video pubblicato con ID: {{ video_id }}</p>
+        <p>Video pubblicato con ID: <a href="https://www.youtube.com/watch?v={{ video_id }}" target="_blank"><b>{{ video_id }}</b></a></p>
         <a href="{{ url_for('ytpub') }}" class="btn btn-primary mt-3">
             Carica un nuovo video
         </a>

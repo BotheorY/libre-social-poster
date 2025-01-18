@@ -1,29 +1,34 @@
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify
-import google
-from google_auth_oauthlib.flow import Flow
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from googleapiclient.http import MediaIoBaseUpload
 import logging
 import os
 import requests
 from urllib.parse import urlparse
 import io
+import json
+from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaIoBaseUpload
+from google.auth.transport.requests import Request as ytr
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()  # Generazione automatica di una chiave segreta sicura
 
-CHUNK_SIZE = 5 * 1024 * 1024  # 50MB in bytes
+# Configurazione per gestire file di grandi dimensioni
+CHUNK_SIZE = 5 * 1024 * 1024  # 5MB in bytes
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024 * 1024  # 5GB
+app.config['REQUEST_CHUNK_SIZE'] = CHUNK_SIZE
 
 # Configurazione dei path assoluti e delle cartelle
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'temp_uploads')
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
-LOG_FILE = os.path.join(BASE_DIR, 'youtube_uploader.log')
 
 # Configurazione del logging
+LOG_FILE = os.path.join(BASE_DIR, 'webapp.log')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -34,32 +39,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configurazione per gestire file di grandi dimensioni
-app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024 * 1024  # 5GB
-app.config['REQUEST_CHUNK_SIZE'] = CHUNK_SIZE
+##################################################################################
+# YOUTUBE ->
+##################################################################################
 
-# Configurazione OAuth 2.0
-YT_CLIENT_SECRETS_FILE = os.path.join(BASE_DIR, 'client_secrets.json')
+# Configurazione YT OAuth 2.0
+YT_CLIENT_SECRETS_FILE = os.path.join(BASE_DIR, 'yt_client_secrets.json')
 YT_SCOPES = ['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube.readonly']
-
-# Creazione cartella upload se non esiste
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
-
-def yt_get_oauth_flow():
-    return Flow.from_client_secrets_file(
-        YT_CLIENT_SECRETS_FILE,
-        scopes=YT_SCOPES,
-        redirect_uri=url_for('yt_oauth2callback', _external=True)
-    )
 
 @app.route('/ytpub')
 @app.route('/ytpub/')
 def ytpub():
     if 'credentials' not in session:
         return render_template('ytpub-login.html')
-    credentials = Credentials(**session['credentials'])
-    youtube = build('youtube', 'v3', credentials=credentials)    
+    youtube = yt_refresh_credentials()
     return render_template('ytpub-upload.html', categories=yt_categories(youtube))
 
 @app.route('/ytauthorize')
@@ -67,26 +60,30 @@ def yt_authorize():
     flow = yt_get_oauth_flow()
     authorization_url, state = flow.authorization_url(
         access_type='offline',
-        include_granted_scopes='true'
+        include_granted_scopes='true',
+        prompt='consent'
     )
     session['state'] = state
     return redirect(authorization_url)
 
 @app.route('/ytoauth2callback')
 def yt_oauth2callback():
-    state = session['state']
-    flow = yt_get_oauth_flow()
-    flow.fetch_token(authorization_response=request.url)
-    credentials = flow.credentials
-    session['credentials'] = {
-        'token': credentials.token,
-        'refresh_token': credentials.refresh_token,
-        'token_uri': credentials.token_uri,
-        'client_id': credentials.client_id,
-        'client_secret': credentials.client_secret,
-        'scopes': credentials.scopes
-    }
-    return redirect(url_for('ytpub'))
+    try:
+        flow = yt_get_oauth_flow()
+        flow.fetch_token(authorization_response=request.url)
+        credentials = flow.credentials
+        session['credentials'] = {
+            'token': credentials.token,
+            'refresh_token': credentials.refresh_token,
+            'token_uri': credentials.token_uri,
+            'client_id': credentials.client_id,
+            'client_secret': credentials.client_secret,
+            'scopes': credentials.scopes
+        }
+    except Exception as e:
+        session.pop('credentials', None)
+        logger.error(f"Errore durante la connessione a YouTube: {e}")
+    return redirect(url_for('ytpub'))           
 
 @app.route('/ytlogout')
 def yt_logout():
@@ -95,10 +92,13 @@ def yt_logout():
     """
     if 'credentials' not in session:
         logger.error(f"Nessuna credenziale da revocare.")
-        return 'Nessuna credenziale da revocare.', 400
+        return redirect(url_for('ytpub'))
 
     try:
-        credentials = google.oauth2.credentials.Credentials(**session['credentials'])
+        yt_refresh_credentials()    
+        credentials = Credentials(**session['credentials'])
+
+        logger.info(f"[300] token = {credentials.token};  refresh_token = {credentials.refresh_token}; session = {session['credentials']}") # DEBUG
         
         revoke = requests.post(
             'https://oauth2.googleapis.com/revoke',
@@ -111,120 +111,16 @@ def yt_logout():
         # Rimuovi le credenziali dalla sessione indipendentemente dal risultato
         session.pop('credentials', None)
         
-        if status_code == 200:
-            return redirect(url_for('ytpub'))
-        else:
-            logger.error(f"Errore nella revoca del token: {revoke.text}")
-            return f'Errore nella revoca del token: {revoke.text}', status_code
+#        if status_code == 200:
+        return redirect(url_for('ytpub'))
+#        else:
+#            logger.error(f"Errore nella revoca del token: {revoke.text}")
+#            return f'Errore nella revoca del token: {revoke.text}', status_code
             
     except Exception as e:
         session.pop('credentials', None)
         logger.error(f"Errore durante la revoca: {str(e)}")
         return f'Errore durante la revoca: {str(e)}', 500
-
-def yt_handle_thumbnail_upload(upload_id, thumb_file):
-    """Gestisce il salvataggio della thumbnail"""
-    try:
-        if thumb_file:
-            extension = os.path.splitext(thumb_file.filename)[1]
-            thumb_path = os.path.join(UPLOAD_FOLDER, f"thumb_{upload_id}{extension}")
-            thumb_file.save(thumb_path)
-            return True
-    except Exception as e:
-        logger.error(f"Errore durante il salvataggio della thumbnail: {str(e)}")
-        return False
-
-def download_file(url, temp_path):
-    """Scarica un file da un URL"""
-    try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        with open(temp_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        return True
-    except Exception as e:
-        logger.error(f"Errore durante il download del file: {str(e)}")
-        return False
-
-# Funzioni di utilità per la gestione dei metadati
-def yt_save_metadata(upload_id, metadata):
-    """Salva i metadati del video nella sessione"""
-    session[f'metadata_{upload_id}'] = {
-        'title': metadata.get('title'),
-        'description': metadata.get('description'),
-        'tags': metadata.get('tags', '').split(',') if metadata.get('tags') else None,
-        'category': metadata.get('category'),
-        'privacy': metadata.get('privacy')
-    }
-
-def download_and_chunk_file(url, upload_id):
-    try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        filename = os.path.basename(urlparse(url).path)
-        extension = os.path.splitext(filename)[1]
-        chunk_number = 0
-        
-        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-            chunk_filename = f"{upload_id}_{chunk_number}{extension}"
-            chunk_path = os.path.join(UPLOAD_FOLDER, chunk_filename)
-            
-            with open(chunk_path, 'wb') as f:
-                f.write(chunk)
-            chunk_number += 1
-            
-#        return True, chunk_number
-        return True
-    except Exception as e:
-        logger.error(f"Errore durante il download del file: {str(e)}")
-#        return False, str(e)
-        return False
-
-def remove_chunks(upload_id):
-    # Pulizia dei file temporanei
-    for filename in os.listdir(UPLOAD_FOLDER):
-        if filename.startswith(upload_id) or filename.startswith(f"thumb_{upload_id}"):
-            try:
-                os.remove(os.path.join(UPLOAD_FOLDER, filename))
-            except Exception as e:
-                logger.error(f"Errore durante la rimozione del file {filename}: {str(e)}")
-
-def _unisci_chunk(upload_id):
-    prefisso = f"{upload_id}_"
-    # Trova tutti i file chunk che iniziano con il prefisso corretto
-    chunk_files = []
-    for nome_file in os.listdir(UPLOAD_FOLDER):
-        if nome_file.startswith(prefisso):
-            # Estrae la parte rimanente dopo il prefisso: {chunk_number}{extension}
-            resto = nome_file[len(prefisso):]
-            # Separa la parte numerica dall'estensione
-            numero_str, estensione = os.path.splitext(resto)
-            try:
-                numero_chunk = int(numero_str)
-            except ValueError:
-                # Se la parte numerica non è valida, ignora questo file
-                continue
-            chunk_files.append((numero_chunk, nome_file, estensione))        
-    # Se non ci sono chunk da unire, esci
-    if not chunk_files:
-        return None
-    # Ordina i chunk in base al numero
-    chunk_files.sort(key=lambda x: x[0])
-    # Usa l'estensione del primo chunk per costruire il nome del file finale
-    _, primo_chunk, estensione = chunk_files[0]
-    nome_file_finale = f"{upload_id}{estensione}"
-    percorso_file_finale = os.path.join(BASE_DIR, nome_file_finale)
-    # Unisci i chunk nel file finale
-    with open(percorso_file_finale, "wb") as outfile:
-        for _, nome_chunk, _ in chunk_files:
-            percorso_chunk = os.path.join(UPLOAD_FOLDER, nome_chunk)
-            with open(percorso_chunk, "rb") as infile:
-                # Legge e scrive il contenuto del chunk nel file finale
-                outfile.write(infile.read())
 
 @app.route('/ytupload/chunk', methods=['POST'])
 def yt_upload_chunk():
@@ -247,7 +143,7 @@ def yt_upload_chunk():
         chunk_path = os.path.join(UPLOAD_FOLDER, chunk_filename)
         
         chunk.save(chunk_path)
-        logger.info(f"Chunk {chunk_number}/{total_chunks} salvato: {chunk_filename}")        
+#        logger.info(f"Chunk {chunk_number}/{total_chunks} salvato: {chunk_filename}")        
         
         # Se questo è l'ultimo chunk, salviamo i metadati
         if int(chunk_number) == int(total_chunks) - 1:
@@ -281,7 +177,6 @@ def yt_upload_url():
             
         temp_path = os.path.join(UPLOAD_FOLDER, f"{upload_id}_0{extension}")
         
-#        if not download_file(video_url, temp_path):
         if not download_and_chunk_file(video_url, upload_id):
             return jsonify({'error': 'Errore durante il download del video'}), 500
             
@@ -334,8 +229,6 @@ def yt_process_upload(upload_id):
     if 'credentials' not in session:
         return redirect(url_for('ytpub'))
 
-    # unisci_chunk(upload_id) # DEBUG
-
     state = request.args.get('state')
     error = request.args.get('error')
     
@@ -347,8 +240,7 @@ def yt_process_upload(upload_id):
     
     if state == 'init_complete':
         try:
-            credentials = Credentials(**session['credentials'])
-            youtube = build('youtube', 'v3', credentials=credentials)
+            youtube = yt_refresh_credentials()
             
             # Preparazione dei metadati
             metadata_key = f'metadata_{upload_id}'
@@ -442,6 +334,13 @@ def yt_process_upload(upload_id):
                          state=state,
                          upload_id=upload_id)
 
+def yt_get_oauth_flow():
+    return Flow.from_client_secrets_file(
+        YT_CLIENT_SECRETS_FILE,
+        scopes=YT_SCOPES,
+        redirect_uri=url_for('yt_oauth2callback', _external=True)
+    )
+
 def yt_categories(youtube):
     """
     Recupera la lista delle categorie video disponibili da YouTube.
@@ -496,6 +395,120 @@ def yt_categories(youtube):
             {'id': '28', 'title': 'Science & Technology'},
             {'id': '29', 'title': 'Nonprofits & Activism'}
         ] 
+
+def yt_handle_thumbnail_upload(upload_id, thumb_file):
+    """Gestisce il salvataggio della thumbnail"""
+    try:
+        if thumb_file:
+            extension = os.path.splitext(thumb_file.filename)[1]
+            thumb_path = os.path.join(UPLOAD_FOLDER, f"thumb_{upload_id}{extension}")
+            thumb_file.save(thumb_path)
+            return True
+    except Exception as e:
+        logger.error(f"Errore durante il salvataggio della thumbnail: {str(e)}")
+        return False
+
+def yt_save_metadata(upload_id, metadata):
+    """Salva i metadati del video nella sessione"""
+    session[f'metadata_{upload_id}'] = {
+        'title': metadata.get('title'),
+        'description': metadata.get('description'),
+        'tags': metadata.get('tags', '').split(',') if metadata.get('tags') else None,
+        'category': metadata.get('category'),
+        'privacy': metadata.get('privacy')
+    }
+
+def yt_refresh_credentials():    
+    # Controllo e rinnovo delle credenziali se necessario
+    if 'credentials' not in session:
+        logger.error("Credenziali mancati nella sessione")
+        raise Exception("Credenziali mancati nella sessione")
+    credentials = Credentials(**session['credentials'])
+
+    logger.info(f"[100] token = {credentials.token};  refresh_token = {credentials.refresh_token}; session = {session['credentials']}") # DEBUG
+
+    if credentials.expired and credentials.refresh_token:
+        try:
+
+            logger.info(f"[200] token = {credentials.token};  refresh_token = {credentials.refresh_token}; session = {session['credentials']}") # DEBUG
+    
+            credentials.refresh(ytr())
+            session['credentials'] = {
+                'token': credentials.token,
+                'refresh_token': credentials.refresh_token,
+                'token_uri': credentials.token_uri,
+                'client_id': credentials.client_id,
+                'client_secret': credentials.client_secret,
+                'scopes': credentials.scopes
+            }
+
+            logger.info(f"[200] refresh_token = {credentials.refresh_token}; session = {session['credentials']}") # DEBUG
+
+        except Exception as e:
+            logger.error(f"Errore nel rinnovo delle credenziali: {e}")
+            session.pop('credentials', None)
+            return redirect(url_for('ytpub'))
+    return build('youtube', 'v3', credentials=credentials, cache_discovery=False)  
+
+##################################################################################
+# <- YOUTUBE
+##################################################################################
+
+def download_and_chunk_file(url, upload_id):
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        filename = os.path.basename(urlparse(url).path)
+        extension = os.path.splitext(filename)[1]
+        chunk_number = 0
+        
+        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+            chunk_filename = f"{upload_id}_{chunk_number}{extension}"
+            chunk_path = os.path.join(UPLOAD_FOLDER, chunk_filename)
+            
+            with open(chunk_path, 'wb') as f:
+                f.write(chunk)
+            chunk_number += 1
+        return True
+    except Exception as e:
+        logger.error(f"Errore durante il download del file: {str(e)}")
+        return False
+
+def download_file(url, temp_path):
+    """Scarica un file da un URL"""
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        with open(temp_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        return True
+    except Exception as e:
+        logger.error(f"Errore durante il download del file: {str(e)}")
+        return False
+
+def remove_chunks(upload_id):
+    # Pulizia dei file temporanei
+    for filename in os.listdir(UPLOAD_FOLDER):
+        if filename.startswith(upload_id) or filename.startswith(f"thumb_{upload_id}"):
+            try:
+                os.remove(os.path.join(UPLOAD_FOLDER, filename))
+            except Exception as e:
+                logger.error(f"Errore durante la rimozione del file {filename}: {str(e)}")    
+
+def json_sfile_2_obj(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            return json.load(file)
+    except FileNotFoundError:
+        raise Exception(f"Errore leggendo il file JSON {file_path}: file non trovato")
+    except json.JSONDecodeError:
+        raise Exception(f"Errore nella decodifica del JSON leggendo il file {file_path}")
+    except Exception as e:
+        raise Exception(f"Errore leggendo il file JSON {file_path}: {e}")
     
 class ChunkedFile(io.RawIOBase):
     def __init__(self, upload_id):

@@ -1,13 +1,13 @@
 <!-- templates/upload.html -->
 {% extends "ytpub.html" %}
 {% block content %}
-<div class="d-flex justify-content-end mt-3">
-    <a href="{{ url_for('yt_logout') }}" class="btn btn-outline-danger">Disconnetti</a>
-</div>
 
 <form id="uploadForm" class="upload-form" onsubmit="return false;">
-    <h2 class="mb-4">Pubblicazione video su YouTube</h2>
-    
+
+    <div style="margin-top: 0px !important; margin-bottom: 1.5em;" class="d-flex justify-content-end mt-3">
+        <a href="{{ url_for('yt_logout') }}" class="btn btn-outline-danger">Disconnetti</a>
+    </div>
+        
     <!-- Video Source -->
     <div class="source-group">
         <h5>Video</h5>
@@ -104,18 +104,18 @@
         </div>
     </div>
 
-    <!-- Progress Bar -->
-    <div class="progress mb-3" style="display: none;" id="uploadProgress">
-        <div class="progress-bar progress-bar-striped progress-bar-animated" 
-             role="progressbar" 
-             style="width: 0%">
-            0%
-        </div>
-    </div>
-    <p id="uploadStatus" class="text-center" style="display: none;"></p>
-
     <button type="button" class="btn btn-primary" id="startUploadBtn" onclick="startUpload()">Inizia pubblicazione</button>
 </form>
+
+<!-- Progress Bar -->
+<div class="progress mb-3" style="display: none;" id="uploadProgress">
+    <div class="progress-bar progress-bar-striped progress-bar-animated" 
+            role="progressbar" 
+            style="width: 0%">
+        0%
+    </div>
+</div>
+<p id="uploadStatus" class="text-center" style="display: none;"></p>
 
 <script>
 // Configurazione per l'upload a chunk
@@ -254,7 +254,9 @@ async function startUpload() {
         return;
     }
 
+    form.style.display = 'none';
     progressDiv.style.display = 'block';
+    statusText.textContent = '';
     statusText.style.display = 'block';
     uploadButton.disabled = true;
 
@@ -282,8 +284,12 @@ async function startUpload() {
         console.error('Upload error:', error);
         statusText.textContent = `Errore durante l'upload: ${error.message}`;
         const progressBar = document.querySelector('#uploadProgress .progress-bar');
+        /*
         progressBar.classList.remove('progress-bar-animated');
         progressBar.classList.add('bg-danger');
+        */
+        progressBar.style.display = 'none';
+        form.style.display = 'block';
         uploadButton.disabled = false;
     }
 }
