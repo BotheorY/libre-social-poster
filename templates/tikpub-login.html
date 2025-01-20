@@ -1,0 +1,9 @@
+{% extends "tikpub.html" %}
+{% block content %}
+<div class="text-center mt-5">
+    <p class="mb-4">Per iniziare, effettua l'accesso al tuo account TikTok</p>
+    <a href="{{ url_for('tik_authorize') }}" class="btn btn-primary btn-lg">
+        Accedi con TikTok
+    </a>
+</div>
+{% endblock %}

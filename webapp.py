@@ -65,10 +65,12 @@ TIK_CLIENT_SECRETS_FILE = os.path.join(BASE_DIR, 'tik_client_secrets.json')
 tik_credentials = json_sfile_to_obj(TIK_CLIENT_SECRETS_FILE)
 TIKTOK_CLIENT_KEY = tik_credentials['client_key']
 TIKTOK_CLIENT_SECRET = tik_credentials['client_secret']
-TIKTOK_AUTH_URL = 'https://open-api.tiktok.com/platform/oauth/connect/'
-TIKTOK_TOKEN_URL = 'https://open-api.tiktok.com/oauth/access_token/'
-TIKTOK_REFRESH_URL = 'https://open-api.tiktok.com/oauth/refresh_token/'
-TIKTOK_UPLOAD_URL = 'https://open-api.tiktok.com/share/video/upload/'
+TIKTOK_AUTH_URL = 'https://www.tiktok.com/v2/auth/authorize/'
+TIKTOK_TOKEN_URL = 'https://open.tiktokapis.com/v2/oauth/token/'
+TIKTOK_REFRESH_URL = 'https://open.tiktokapis.com/v2/oauth/token/'
+TIKTOK_UPLOAD_URL = 'https://open.tiktokapis.com/v2/post/publish/inbox/video/init/'
+TIKTOK_QUERY_CREATOR_URL = 'https://open.tiktokapis.com/v2/post/publish/creator_info/query/'
+TIKTOK_PUBLISH_URL = 'https://open.tiktokapis.com/v2/post/publish/video/init/'
 
 @app.route('/tikpub')
 @app.route('/tikpub/')
@@ -85,7 +87,7 @@ def tik_authorize():
     auth_params = {
         'client_key': TIKTOK_CLIENT_KEY,
         'response_type': 'code',
-        'scope': 'video.upload',
+        'scope': 'user.info.basic,video.publish,video.upload',
         'redirect_uri': url_for('tik_oauth2callback', _external=True),
         'state': csrf_state
     }
@@ -94,8 +96,12 @@ def tik_authorize():
     return redirect(authorization_url)
 
 @app.route('/tikoauth2callback')
+@app.route('/tikoauth2callback/')
 def tik_oauth2callback():
     try:
+
+        logger.info(f"tikoauth2callback loaded whit params: {request.args}")    # DEBUG
+
         if request.args.get('state') != session.get('csrf_state'):
             raise ValueError("CSRF state mismatch")
             
@@ -107,6 +113,7 @@ def tik_oauth2callback():
         token_data = {
             'client_key': TIKTOK_CLIENT_KEY,
             'client_secret': TIKTOK_CLIENT_SECRET,
+            'redirect_uri': url_for('tik_oauth2callback', _external=True),
             'code': code,
             'grant_type': 'authorization_code'
         }
@@ -138,38 +145,148 @@ def tik_logout():
 
 @app.route('/tikupload/chunk', methods=['POST'])
 def tik_upload_chunk():
-    try:
-        chunk = request.files.get('chunk')
-        chunk_number = request.form.get('chunk_number')
-        total_chunks = request.form.get('total_chunks')
-        upload_id = request.form.get('upload_id')
-        original_filename = request.form.get('original_filename')
+    return upload_chunk(tik_save_metadata, 'tik_process_upload')
+
+def upload_video_to_tiktok(
+    access_token: str,
+    upload_id: str,
+    client_key: str,
+    video_folder: str = "temp_uploads",
+    description: str = "Il mio video su TikTok"
+):
+    """
+    Carica e pubblica un video su TikTok usando l'upload a chunk.
+    
+    :param access_token:    Token di accesso con permessi validi per caricare video.
+    :param open_id:         Identificatore utente (fornito da TikTok dopo l'autenticazione).
+    :param client_key:      Client key (app key) dell'app registrata su TikTok Developers.
+    :param video_folder:    Cartella che contiene i chunk del video (video_1.mp4, video_2.mp4, ecc.).
+    :param description:     Descrizione/testo del video da pubblicare.
+
+    :return:                Dizionario con dati di risposta dalla pubblicazione, oppure eccezione se fallisce.
+    """
+    
+    # Endpoint base per la chiamata (varia a seconda dell'API e della versione!)
+    # Qui usiamo un endpoint "ipotetico" derivato da TikTok Open API / Video Upload
+    BASE_URL = "https://open-api.tiktok.com"
+    
+    # 1) Leggi tutti i chunk disponibili nella cartella video_folder, ordinandoli per numero
+    #    Assumiamo che i file abbiano la forma video_1.mp4, video_2.mp4, ...
+    chunk_files = []
+    for filename in os.listdir(video_folder):
+        if filename.startswith(upload_id) and filename.endswith(".mp4"):
+            # Estrai il numero dopo "video_" e prima di ".mp4"
+            # Esempio: "video_12.mp4" -> 12
+            try:
+                part_number = int(filename.replace(f"{upload_id}_", "").replace(".mp4", ""))
+                chunk_files.append((part_number, os.path.join(video_folder, filename)))
+            except ValueError:
+                # Se non riesce a convertire in int, ignora il file
+                pass
+    
+    # Ordina i file in base al numero del chunk
+    chunk_files.sort(key=lambda x: x[0])
+    
+    # Se non ci sono file, interrompi
+    if not chunk_files:
+        raise ValueError(f"Nessun file chunk trovato nella cartella {video_folder}.")
+    
+    # Calcola dimensione totale del video sommando la dimensione di ogni chunk
+    total_size = 0
+    for _, path in chunk_files:
+        total_size += os.path.getsize(path)
+    
+    # 2) Inizializza la sessione di upload (INIT)
+    #    L'API di init potrebbe richiedere parametri aggiuntivi come la dimensione totale del file, il MD5, ecc.
+    #    Il seguente payload e endpoint sono a scopo illustrativo; controlla la doc ufficiale per i campi corretti.
+    init_url = f"{BASE_URL}/video/upload/init/"
+    init_payload = {
+        "access_token": access_token,
+        "client_key": client_key,
+        "video_size": total_size,
+        # eventuali altri campi richiesti da TikTok
+    }
+    
+    init_response = requests.post(init_url, json=init_payload, timeout=60)
+    init_data = init_response.json()
+    
+    if init_response.status_code != 200 or "data" not in init_data:
+        raise RuntimeError(f"Errore durante INIT: {init_response.text}")
+    
+    upload_id = init_data["data"].get("upload_id")
+    if not upload_id:
+        raise RuntimeError("Impossibile ottenere upload_id dalla risposta INIT.")
+    
+    # 3) Caricamento chunk per chunk (UPLOAD PART)
+    part_url = f"{BASE_URL}/video/upload/part/"
+    
+    for index, (part_number, chunk_path) in enumerate(chunk_files, start=1):
+        with open(chunk_path, "rb") as f:
+            chunk_data = f.read()
         
-        if not all([chunk, chunk_number, total_chunks, upload_id, original_filename]):
-            return jsonify({'error': 'Missing parameters'}), 400
-            
-        extension = os.path.splitext(original_filename)[1]
-        chunk_filename = f"{upload_id}_{chunk_number}{extension}"
-        chunk_path = os.path.join(UPLOAD_FOLDER, chunk_filename)
+        part_payload = {
+            "access_token": access_token,
+#            "open_id": open_id,
+            "client_key": client_key,
+            "upload_id": upload_id,
+            "part_number": index,   # Indice sequenziale richiesto dall'API
+        }
         
-        chunk.save(chunk_path)
+        # Alcune API accettano i chunk come multipart/form-data
+        # others come raw data con un header specifico. Qui mostriamo multipart:
+        files = {
+            "video_chunk": (f"chunk_{index}.mp4", chunk_data, "video/mp4")
+        }
         
-        if int(chunk_number) == int(total_chunks) - 1:
-            tik_save_metadata(upload_id, request.form)
-            return jsonify({
-                'success': True,
-                'message': 'Upload complete',
-                'redirect': url_for('tik_process_upload', upload_id=upload_id, state='init_complete')
-            })
-            
-        return jsonify({'success': True, 'message': 'Chunk received'})
+        part_response = requests.post(part_url, data=part_payload, files=files, timeout=120)
+        part_data = part_response.json()
         
-    except Exception as e:
-        logger.error(f"Error in chunk upload: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        if part_response.status_code != 200 or not part_data.get("data", {}).get("is_success"):
+            raise RuntimeError(f"Errore durante UPLOAD PART {index}: {part_response.text}")
+        
+        print(f"Caricato chunk n°{index} ({chunk_path}) con successo.")
+    
+    # 4) Completa l'upload (COMPLETE)
+    complete_url = f"{BASE_URL}/video/upload/complete/"
+    complete_payload = {
+        "access_token": access_token,
+#        "open_id": open_id,
+        "client_key": client_key,
+        "upload_id": upload_id,
+    }
+    
+    complete_response = requests.post(complete_url, json=complete_payload, timeout=60)
+    complete_data = complete_response.json()
+    
+    if complete_response.status_code != 200 or not complete_data.get("data", {}).get("is_success"):
+        raise RuntimeError(f"Errore durante COMPLETE: {complete_response.text}")
+    
+    # 5) Pubblica il video (PUBLISH)
+    publish_url = f"{BASE_URL}/video/publish/"
+    publish_payload = {
+        "access_token": access_token,
+#        "open_id": open_id,
+        "client_key": client_key,
+        "upload_id": upload_id,
+        "text": description  # La descrizione del video
+    }
+    
+    publish_response = requests.post(publish_url, json=publish_payload, timeout=60)
+    publish_data = publish_response.json()
+    
+    if publish_response.status_code != 200 or not publish_data.get("data", {}).get("video_id"):
+        raise RuntimeError(f"Errore durante PUBLISH: {publish_response.text}")
+    
+    video_id = publish_data["data"].get("video_id")
+    print(f"Video pubblicato con successo! Video ID: {video_id}")
+    
+    return publish_data
 
 @app.route('/tikprocess/<upload_id>')
 def tik_process_upload(upload_id):
+
+    logger.info("[100]")  #DEBUG
+
     if 'tiktok_access_token' not in session:
         return redirect(url_for('tikpub'))
 
@@ -183,9 +300,12 @@ def tik_process_upload(upload_id):
                              upload_id=upload_id)
     
     if state == 'init_complete':
+
+        logger.info("[200]")  #DEBUG
+
         try:
             # Ensure token is fresh
-            refresh_tiktok_token_if_needed()
+            tik_refresh_credentials()
             
             # Get metadata
             metadata_key = f'metadata_{upload_id}'
@@ -196,41 +316,85 @@ def tik_process_upload(upload_id):
             
             # Combine all chunks into a single file
             final_path = os.path.join(UPLOAD_FOLDER, f"final_{upload_id}.mp4")
+
+
+
+
+#            res = upload_video_to_tiktok(session['tiktok_access_token'], upload_id, TIKTOK_CLIENT_KEY, UPLOAD_FOLDER, metadata['description'])
+#            remove_chunks(upload_id)
+#            session.pop(metadata_key, None)            
+#            return redirect(url_for('tik_process_upload', upload_id=upload_id, state='complete'))
+
+
+
             combine_chunks(upload_id, final_path)
+            total_size = os.path.getsize(final_path)
+
+            logger.info("[300]")  #DEBUG
+
             
-            # Upload to TikTok
             with open(final_path, 'rb') as video_file:
+
+                logger.info(f"[400] metadata = {metadata}")  #DEBUG
+
+
+                # First, request an upload URL
                 headers = {
-                    'Authorization': f"Bearer {session['tiktok_access_token']}"
+                    'Authorization': f"Bearer {session['tiktok_access_token']}",
+                    'Content-Type': "application/json; charset=UTF-8",
                 }
                 
-                # First, request an upload URL
-                upload_params = {
-                    'open_id': session.get('tiktok_open_id'),
-                    'access_token': session['tiktok_access_token']
+                params = {
+                    "post_info": {
+                        'privacy_level': metadata['privacy'],
+                        'title': metadata['description']
+                    }, 
+                    "source_info": {
+                        'source': 'FILE_UPLOAD',
+                        'video_size': total_size,
+                        'chunk_size': total_size,
+                        'total_chunk_count': 1
+                    }
                 }
+
+                logger.info(f"[500] params = {params}")  #DEBUG
+
                 
                 upload_url_response = requests.post(
                     TIKTOK_UPLOAD_URL,
-                    params=upload_params
+                    headers=headers,
+                    json=params
                 ).json()
+
+                logger.info("[600]")  #DEBUG
+
+
+                logger.info(f"upload_url_response: {upload_url_response}")  #DEBUG
                 
-                if 'upload_url' not in upload_url_response:
-                    raise Exception("Failed to get upload URL from TikTok")
-                
+                if ('data' not in upload_url_response) or ('upload_url' not in upload_url_response.get('data')):
+                    error_code = upload_url_response.get('error')['code']
+                    error_msg = upload_url_response.get('error')['message']
+                    if error_code != 'ok':
+                        raise Exception(f'[{error_code}] Failed to get upload URL from TikTok cause "{error_msg}"')
+                    else:
+                        raise Exception("Failed to get upload URL from TikTok")
+
                 # Then upload the video
-                files = {
-                    'video': ('video.mp4', video_file, 'video/mp4')
+                headers = {
+                    'Content-Type': "video/mp4",
+                    'Content-Range': f"bytes 0-{total_size - 1}/{total_size}",
+                    'Content-Length': f"{total_size}"
                 }
                 
-                upload_response = requests.post(
-                    upload_url_response['upload_url'],
-                    files=files,
+                upload_url = upload_url_response.get('data')['upload_url']
+                file_data = video_file.read()
+                upload_response = requests.put(
+                    upload_url,
+                    data=file_data,
                     headers=headers
-                ).json()
-                
-                if upload_response.get('error_code', 0) != 0:
-                    raise Exception(f"TikTok upload failed: {upload_response.get('description')}")
+                )
+
+                logger.info(f"[{upload_response.status_code}] upload_url: {upload_url}; upload_response: {upload_response}")  #DEBUG
                 
             # Clean up
             remove_chunks(upload_id)
@@ -260,7 +424,7 @@ def tik_process_upload(upload_id):
 def tik_verfile():
     return f"tiktok-developers-site-verification=abKGNUGYiZ9K9NrN1U6fFiGVJpOy5y04"
 
-def refresh_tiktok_token_if_needed():
+def tik_refresh_credentials():
     """Refresh TikTok access token if it's close to expiring"""
     if time.time() >= session.get('tiktok_token_expires', 0) - 300:  # 5 minutes buffer
         try:
@@ -286,11 +450,10 @@ def refresh_tiktok_token_if_needed():
             raise
 
 def tik_save_metadata(upload_id, metadata):
-    """Save video metadata in session"""
+    """Salva i metadati del video nella sessione"""
     session[f'metadata_{upload_id}'] = {
-        'title': metadata.get('title'),
         'description': metadata.get('description'),
-        'privacy': metadata.get('privacy', 'PRIVATE')
+        'privacy': metadata.get('privacy')
     }
 
 def combine_chunks(upload_id, final_path):
@@ -390,41 +553,7 @@ def yt_logout():
 
 @app.route('/ytupload/chunk', methods=['POST'])
 def yt_upload_chunk():
-    """
-    Gestisce l'upload di un singolo chunk del file.
-    Ogni chunk viene salvato come file temporaneo separato.
-    """
-    try:
-        chunk = request.files.get('chunk')
-        chunk_number = request.form.get('chunk_number')
-        total_chunks = request.form.get('total_chunks')
-        upload_id = request.form.get('upload_id')
-        original_filename = request.form.get('original_filename')
-        
-        if not all([chunk, chunk_number, total_chunks, upload_id, original_filename]):
-            return jsonify({'error': 'Parametri mancanti'}), 400
-            
-        extension = os.path.splitext(original_filename)[1]
-        chunk_filename = f"{upload_id}_{chunk_number}{extension}"
-        chunk_path = os.path.join(UPLOAD_FOLDER, chunk_filename)
-        
-        chunk.save(chunk_path)
-#        logger.info(f"Chunk {chunk_number}/{total_chunks} salvato: {chunk_filename}")        
-        
-        # Se questo è l'ultimo chunk, salviamo i metadati
-        if int(chunk_number) == int(total_chunks) - 1:
-            yt_save_metadata(upload_id, request.form)
-            return jsonify({
-                'success': True,
-                'message': 'Upload completato',
-                'redirect': url_for('yt_process_upload', upload_id=upload_id, state='init_complete')
-            })
-            
-        return jsonify({'success': True, 'message': 'Chunk ricevuto'})
-        
-    except Exception as e:
-        logger.error(f"Errore nell'upload del chunk: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+    return upload_chunk(yt_save_metadata, 'yt_process_upload')
 
 @app.route('/ytupload/url', methods=['POST'])
 def yt_upload_url():
@@ -755,6 +884,42 @@ def remove_chunks(upload_id):
                 os.remove(os.path.join(UPLOAD_FOLDER, filename))
             except Exception as e:
                 logger.error(f"Errore durante la rimozione del file {filename}: {str(e)}")  
+
+def upload_chunk(save_metadata_callback, redir_func_name):
+    """
+    Gestisce l'upload di un singolo chunk del file.
+    Ogni chunk viene salvato come file temporaneo separato.
+    """
+    try:
+        chunk = request.files.get('chunk')
+        chunk_number = request.form.get('chunk_number')
+        total_chunks = request.form.get('total_chunks')
+        upload_id = request.form.get('upload_id')
+        original_filename = request.form.get('original_filename')
+        
+        if not all([chunk, chunk_number, total_chunks, upload_id, original_filename]):
+            return jsonify({'error': 'Parametri mancanti'}), 400
+            
+        extension = os.path.splitext(original_filename)[1]
+        chunk_filename = f"{upload_id}_{chunk_number}{extension}"
+        chunk_path = os.path.join(UPLOAD_FOLDER, chunk_filename)
+        
+        chunk.save(chunk_path)
+       
+        # Se questo è l'ultimo chunk, salviamo i metadati
+        if int(chunk_number) == int(total_chunks) - 1:
+            save_metadata_callback(upload_id, request.form)
+            return jsonify({
+                'success': True,
+                'message': 'Upload completato',
+                'redirect': url_for(redir_func_name, upload_id=upload_id, state='init_complete')
+            })
+            
+        return jsonify({'success': True, 'message': 'Chunk ricevuto'})
+        
+    except Exception as e:
+        logger.error(f"Errore nell'upload del chunk: {e}")
+        return jsonify({'error': str(e)}), 500
      
 class ChunkedFile(io.RawIOBase):
     def __init__(self, upload_id):

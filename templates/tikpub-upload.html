@@ -1,10 +1,10 @@
-{% extends "ytpub.html" %}
+{% extends "tikpub.html" %}
 {% block content %}
 
 <form id="uploadForm" class="upload-form" onsubmit="return false;">
 
     <div style="margin-top: 0px !important; margin-bottom: 1.5em;" class="d-flex justify-content-end mt-3">
-        <a href="{{ url_for('yt_logout') }}" class="btn btn-outline-danger">Disconnetti</a>
+        <a href="{{ url_for('tik_logout') }}" class="btn btn-outline-danger">Disconnetti</a>
     </div>
         
     <!-- Video Source -->
@@ -33,72 +33,20 @@
         </div>
     </div>
 
-    <!-- Thumbnail -->
-    <div class="source-group">
-        <h5>Thumbnail (opzionale)</h5>
-        <div class="mb-3">
-            <div class="form-check">
-                <input class="form-check-input" type="radio" name="thumbnail_source" id="no_thumbnail" value="none" checked>
-                <label class="form-check-label" for="no_thumbnail">
-                    Nessuna thumbnail
-                </label>
-            </div>
-            
-            <div class="form-check">
-                <input class="form-check-input" type="radio" name="thumbnail_source" id="thumbnail_file" value="file">
-                <label class="form-check-label" for="thumbnail_file">
-                    Carica file
-                </label>
-            </div>
-            <div class="mb-3 ms-4" id="thumbnail_file_input" style="display: none;">
-                <input type="file" class="form-control" name="thumbnail" id="thumbnail" accept="image/*">
-            </div>
-            
-            <div class="form-check">
-                <input class="form-check-input" type="radio" name="thumbnail_source" id="thumbnail_url" value="url">
-                <label class="form-check-label" for="thumbnail_url">
-                    URL immagine
-                </label>
-            </div>
-            <div class="mb-3 ms-4" id="thumbnail_url_input" style="display: none;">
-                <input type="url" class="form-control" name="thumbnail_url" id="thumbnail_url_field" placeholder="https://...">
-            </div>
-        </div>
-    </div>
-
     <!-- Metadata -->
     <div class="source-group">
         <h5>Metadati</h5>
         <div class="mb-3">
-            <label for="title" class="form-label">Titolo *</label>
-            <input type="text" class="form-control" id="title" name="title" required>
-        </div>
-        
-        <div class="mb-3">
-            <label for="description" class="form-label">Descrizione</label>
-            <textarea class="form-control" id="description" name="description" rows="3"></textarea>
-        </div>
-        
-        <div class="mb-3">
-            <label for="tags" class="form-label">Tag (separati da virgola)</label>
-            <input type="text" class="form-control" id="tags" name="tags" placeholder="tag1, tag2, tag3">
-        </div>
-        
-        <div class="mb-3">
-            <label for="category" class="form-label">Categoria *</label>
-            <select class="form-select" id="category" name="category" required>
-                {% for category in categories %}
-                <option value="{{ category['id'] }}">{{ category['title'] }}</option>
-                {% endfor %}
-            </select>
+            <label for="description" class="form-label">Descrizione *</label>
+            <textarea class="form-control" id="description" name="description" rows="3" required></textarea>
         </div>
         
         <div class="mb-3">
             <label for="privacy" class="form-label">Visibilità *</label>
             <select class="form-select" id="privacy" name="privacy" required>
-                <option value="public">Pubblico</option>
-                <option value="unlisted">Non in elenco</option>
-                <option value="private">Privato</option>
+                <option value="PUBLIC_TO_EVERYONE">Tutti (pubblico)</option>
+                <option value="MUTUAL_FOLLOW_FRIENDS">Follower che anche tu segui</option>
+                <option value="SELF_ONLY">Solo tu (privato)</option>
             </select>
         </div>
     </div>
@@ -127,7 +75,7 @@ async function uploadChunk(chunk, params) {
         formData.append(key, params[key]);
     }
 
-    const response = await fetch('/ytupload/chunk', {
+    const response = await fetch('/tikupload/chunk', {
         method: 'POST',
         body: formData
     });
@@ -157,10 +105,7 @@ async function handleFileUpload(file, upload_id) {
 
         // Aggiungiamo i metadati solo nell'ultimo chunk
         if (chunkNumber === totalChunks - 1) {
-            params.title = document.getElementById('title').value;
             params.description = document.getElementById('description').value;
-            params.tags = document.getElementById('tags').value;
-            params.category = document.getElementById('category').value;
             params.privacy = document.getElementById('privacy').value;
         }
 
@@ -183,13 +128,9 @@ async function handleUrlUpload(url, upload_id) {
     const formData = new FormData();
     formData.append('video_url', url);
     formData.append('upload_id', upload_id);
-    formData.append('title', document.getElementById('title').value);
     formData.append('description', document.getElementById('description').value);
-    formData.append('tags', document.getElementById('tags').value);
-    formData.append('category', document.getElementById('category').value);
-    formData.append('privacy', document.getElementById('privacy').value);
 
-    const response = await fetch('/ytupload/url', {
+    const response = await fetch('/tikupload/url', {
         method: 'POST',
         body: formData
     });
@@ -211,35 +152,6 @@ function updateProgress(uploadedChunks, totalChunks) {
     progressBar.textContent = Math.round(progress) + '%';
     document.getElementById('uploadStatus').textContent = 
         `Uploading chunk ${uploadedChunks}/${totalChunks}`;
-}
-
-async function uploadThumbnail(upload_id) {
-    const thumbnailSource = document.querySelector('input[name="thumbnail_source"]:checked').value;
-    if (thumbnailSource === 'none') return;
-
-    const formData = new FormData();
-    formData.append('upload_id', upload_id);
-
-    if (thumbnailSource === 'file') {
-        const thumbnailFile = document.getElementById('thumbnail').files[0];
-        if (thumbnailFile) {
-            formData.append('thumbnail', thumbnailFile);
-        }
-    } else if (thumbnailSource === 'url') {
-        const thumbnailUrl = document.getElementById('thumbnail_url_field').value;
-        if (thumbnailUrl) {
-            formData.append('thumbnail_url', thumbnailUrl);
-        }
-    }
-
-    const response = await fetch('/ytupload/thumbnail', {
-        method: 'POST',
-        body: formData
-    });
-
-    if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-    }
 }
 
 async function startUpload() {
@@ -277,8 +189,6 @@ async function startUpload() {
             await handleUrlUpload(videoUrl, upload_id);
         }
 
-        await uploadThumbnail(upload_id);
-
     } catch (error) {
         console.error('Upload error:', error);
         statusText.textContent = `Errore durante l'upload: ${error.message}`;
@@ -299,14 +209,5 @@ document.querySelectorAll('input[name="video_source"]').forEach(input => {
     });
 });
 
-// Gestione della visibilità dei campi input thumbnail
-document.querySelectorAll('input[name="thumbnail_source"]').forEach(input => {
-    input.addEventListener('change', (e) => {
-        document.getElementById('thumbnail_file_input').style.display = 
-            e.target.value === 'file' ? 'block' : 'none';
-        document.getElementById('thumbnail_url_input').style.display = 
-            e.target.value === 'url' ? 'block' : 'none';
-    });
-});
 </script>
 {% endblock %}
