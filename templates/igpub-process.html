@@ -1,0 +1,55 @@
+# igpub-process.html
+{% extends "igpub.html" %}
+{% block content %}
+<div class="progress-container">
+    {% if error %}
+        <div class="alert alert-danger" role="alert">
+            An error occurred: {{ error }}
+        </div>
+        <a href="{{ url_for('igpub') }}" class="btn btn-primary mt-3">
+            Upload a new video
+        </a>
+    {% elif state == 'init_complete' %}
+        <h4 class="mb-4">Initializing video upload</h4>
+        <div class="progress mb-4">
+            <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                 role="progressbar" 
+                 style="width: 33%">
+                33%
+            </div>
+        </div>
+        <p>Preparazione upload del video...</p>
+    {% elif state == 'complete' %}
+        <h4 class="mb-4">Upload su Instagram completato con successo</h4>
+        <div class="progress mb-4">
+            <div class="progress-bar bg-success" 
+                 role="progressbar" 
+                 style="width: 100%">
+                100%
+            </div>
+        </div>
+        <p>Video pubblicato con ID: <b>{{ media_id }}</b></p>
+        <a href="{{ url_for('igpub') }}" class="btn btn-primary mt-3">
+            Pubblica un nuovo video
+        </a>
+    {% else %}
+        <h4 class="mb-4">Pubblicazione video</h4>
+        <div class="progress mb-4">
+            <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                 role="progressbar" 
+                 style="width: 66%">
+                66%
+            </div>
+        </div>
+        <p>Upload in corso su Instagram...</p>
+    {% endif %}
+</div>
+
+{% if state != 'complete' and not error %}
+<script>
+    setTimeout(() => {
+        window.location.reload();
+    }, 2000);
+</script>
+{% endif %}
+{% endblock %}

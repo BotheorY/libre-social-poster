@@ -1,0 +1,10 @@
+# igpub-login.html
+{% extends "igpub.html" %}
+{% block content %}
+<div class="text-center mt-5">
+    <p class="mb-4">Collegati al tuo account Instagram per iniziare la pubblicazione</p>
+    <a href="{{ url_for('ig_auth') }}" class="btn btn-primary btn-lg">
+        Login with Instagram
+    </a>
+</div>
+{% endblock %}

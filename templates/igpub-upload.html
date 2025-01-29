@@ -1,0 +1,150 @@
+# igpub-upload.html
+{% extends "igpub.html" %}
+{% block content %}
+
+<form id="uploadForm" class="upload-form" onsubmit="return false;">
+    <div style="margin-top: 0px !important; margin-bottom: 1.5em;" class="d-flex justify-content-end mt-3">
+        <a href="{{ url_for('ig_logout') }}" class="btn btn-outline-danger">Logout</a>
+    </div>
+        
+    <!-- Video Source -->
+    <div class="source-group">
+        <h5>Video</h5>
+        <div class="mb-3">
+            <input type="file" class="form-control" name="video" id="video" accept="video/*" required>
+        </div>
+    </div>
+
+    <!-- Metadata -->
+    <div class="source-group">
+        <h5>Post Details</h5>
+        <div class="mb-3">
+            <label for="title" class="form-label">Title *</label>
+            <input type="text" class="form-control" id="title" name="title" required>
+        </div>
+        
+        <div class="mb-3">
+            <label for="caption" class="form-label">Caption</label>
+            <textarea class="form-control" id="caption" name="caption" rows="3"></textarea>
+        </div>
+    </div>
+
+    <button type="button" class="btn btn-primary" id="startUploadBtn" onclick="startUpload()">Start Upload</button>
+</form>
+
+<!-- Progress Bar -->
+<div class="progress mb-3" style="display: none;" id="uploadProgress">
+    <div class="progress-bar progress-bar-striped progress-bar-animated" 
+            role="progressbar" 
+            style="width: 0%">
+        0%
+    </div>
+</div>
+<p id="uploadStatus" class="text-center" style="display: none;"></p>
+
+<script>
+// Upload configuration
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB per chunk
+
+async function uploadChunk(chunk, params) {
+    const formData = new FormData();
+    formData.append('chunk', chunk);
+    for (let key in params) {
+        formData.append(key, params[key]);
+    }
+
+    const response = await fetch('/igupload/chunk', {
+        method: 'POST',
+        body: formData
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    return await response.json();
+}
+
+async function handleFileUpload(file, upload_id) {
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    let uploadedChunks = 0;
+
+    for (let chunkNumber = 0; chunkNumber < totalChunks; chunkNumber++) {
+        const start = chunkNumber * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const chunk = file.slice(start, end);
+
+        const params = {
+            chunk_number: chunkNumber,
+            total_chunks: totalChunks,
+            upload_id: upload_id,
+            original_filename: file.name
+        };
+
+        // Add metadata with the last chunk
+        if (chunkNumber === totalChunks - 1) {
+            params.title = document.getElementById('title').value;
+            params.caption = document.getElementById('caption').value;
+        }
+
+        try {
+            const result = await uploadChunk(chunk, params);
+            uploadedChunks++;
+            updateProgress(uploadedChunks, totalChunks);
+
+            if (result.redirect) {
+                window.location.href = result.redirect;
+                return;
+            }
+        } catch (error) {
+            throw new Error(`Errore nell'upload del chunk ${chunkNumber}: ${error.message}`);
+        }
+    }
+}
+
+function updateProgress(uploadedChunks, totalChunks) {
+    const progress = (uploadedChunks / totalChunks) * 100;
+    const progressBar = document.querySelector('#uploadProgress .progress-bar');
+    progressBar.style.width = progress + '%';
+    progressBar.textContent = Math.round(progress) + '%';
+    document.getElementById('uploadStatus').textContent = 
+        `Upload del chunk ${uploadedChunks}/${totalChunks}`;
+}
+
+async function startUpload() {
+    const form = document.getElementById('uploadForm');
+    const progressDiv = document.getElementById('uploadProgress');
+    const statusText = document.getElementById('uploadStatus');
+    const uploadButton = document.getElementById('startUploadBtn');
+
+    if (!form.checkValidity()) {
+        form.reportValidity();
+        return;
+    }
+
+    form.style.display = 'none';
+    progressDiv.style.display = 'block';
+    statusText.textContent = '';
+    statusText.style.display = 'block';
+    uploadButton.disabled = true;
+
+    const upload_id = crypto.randomUUID();
+    const videoFile = document.getElementById('video').files[0];
+
+    try {
+        if (!videoFile) {
+            throw new Error('Seleziona un file video');
+        }
+        await handleFileUpload(videoFile, upload_id);
+
+    } catch (error) {
+        console.error("Errore nell'upload:", error);
+        statusText.textContent = `Errore nell'upload: ${error.message}`;
+        const progressBar = document.querySelector('#uploadProgress .progress-bar');
+        progressBar.style.display = 'none';
+        form.style.display = 'block';
+        uploadButton.disabled = false;
+    }
+}
+</script>
+{% endblock %}

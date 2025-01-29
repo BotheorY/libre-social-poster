@@ -12,6 +12,8 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.http import MediaIoBaseUpload
 from google.auth.transport.requests import Request as ytr
+from facebook import GraphAPI
+from instagram_private_api import Client, ClientCompatPatch
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()  # Generazione automatica di una chiave segreta sicura
@@ -51,10 +53,177 @@ def json_sfile_to_obj(file_path):
     except Exception as e:
         raise Exception(f"Errore leggendo il file JSON {file_path}: {e}")     
     
+@app.route('/')
+def home():
+    return render_template('home.html')
+    
 @app.route('/robots.txt')
 @app.route('/robots.txt/')
 def robots():
     return Response("User-agent: *\nDisallow: /\n", mimetype='text/plain')
+
+##################################################################################
+# INSTAGRAM ->
+##################################################################################
+
+# Instagram API Configuration
+INSTAGRAM_APP_ID = 'your_app_id'
+INSTAGRAM_APP_SECRET = 'your_app_secret'
+INSTAGRAM_REDIRECT_URI = 'http://localhost:5000/instagram_callback'
+
+@app.route('/igpub')
+@app.route('/igpub/')
+def igpub():
+    if 'instagram_access_token' not in session:
+        return render_template('igpub-login.html')
+    return render_template('igpub-upload.html')
+
+@app.route('/igauth')
+def ig_auth():
+    auth_url = f"https://api.instagram.com/oauth/authorize?client_id={INSTAGRAM_APP_ID}&redirect_uri={INSTAGRAM_REDIRECT_URI}&scope=user_profile,user_media&response_type=code"
+    return redirect(auth_url)
+
+@app.route('/igoauth2callback')
+def ig_oauth2callback():
+    code = request.args.get('code')
+    if not code:
+        return 'Authorization failed', 400
+
+    try:
+        # Exchange code for access token
+        token_url = 'https://api.instagram.com/oauth/access_token'
+        response = requests.post(token_url, data={
+            'client_id': INSTAGRAM_APP_ID,
+            'client_secret': INSTAGRAM_APP_SECRET,
+            'grant_type': 'authorization_code',
+            'redirect_uri': INSTAGRAM_REDIRECT_URI,
+            'code': code
+        })
+        
+        data = response.json()
+        session['instagram_access_token'] = data['access_token']
+        session['instagram_user_id'] = data['user_id']
+        
+        return redirect(url_for('igpub'))
+        
+    except Exception as e:
+        logger.error(f"Error during Instagram authentication: {str(e)}")
+        return redirect(url_for('igpub'))
+
+@app.route('/iglogout')
+def ig_logout():
+    session.pop('instagram_access_token', None)
+    session.pop('instagram_user_id', None)
+    return redirect(url_for('igpub'))
+
+@app.route('/igupload/chunk', methods=['POST'])
+def ig_upload_chunk():
+    try:
+        chunk = request.files.get('chunk')
+        chunk_number = request.form.get('chunk_number')
+        total_chunks = request.form.get('total_chunks')
+        upload_id = request.form.get('upload_id')
+        original_filename = request.form.get('original_filename')
+        
+        if not all([chunk, chunk_number, total_chunks, upload_id, original_filename]):
+            return jsonify({'error': 'Missing parameters'}), 400
+            
+        extension = os.path.splitext(original_filename)[1]
+        chunk_filename = f"{upload_id}_{chunk_number}{extension}"
+        chunk_path = os.path.join(UPLOAD_FOLDER, chunk_filename)
+        
+        chunk.save(chunk_path)
+        
+        if int(chunk_number) == int(total_chunks) - 1:
+            ig_save_metadata(upload_id, request.form)
+            return jsonify({
+                'success': True,
+                'message': 'Upload completed',
+                'redirect': url_for('ig_process_upload', upload_id=upload_id, state='init_complete')
+            })
+            
+        return jsonify({'success': True, 'message': 'Chunk received'})
+        
+    except Exception as e:
+        logger.error(f"Error in chunk upload: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/igprocess/<upload_id>')
+def ig_process_upload(upload_id):
+    if 'instagram_access_token' not in session:
+        return redirect(url_for('igpub'))
+
+    state = request.args.get('state')
+    error = request.args.get('error')
+    
+    if error:
+        remove_chunks(upload_id)
+        return render_template('igpub-process.html', 
+                             error=error,
+                             upload_id=upload_id)
+    
+    if state == 'init_complete':
+        try:
+            # Initialize Instagram API client
+            api = Client(
+                auto_patch=True,
+                authenticate=False,
+                access_token=session['instagram_access_token']
+            )
+
+            # Get metadata for the upload
+            metadata_key = f'metadata_{upload_id}'
+            if metadata_key not in session:
+                raise Exception("Metadata not found for this upload")
+                
+            metadata = session[metadata_key]
+            
+            # Create a chunked file reader
+            chunk_file = ChunkedFile(upload_id)
+            
+            # Upload video to Instagram
+            media = api.video_upload(
+                chunk_file,
+                caption=metadata['caption'],
+                title=metadata['title']
+            )
+            
+            # Clean up
+            remove_chunks(upload_id)
+            session.pop(metadata_key, None)
+            
+            return redirect(url_for('ig_process_upload',
+                                  upload_id=upload_id,
+                                  state='complete',
+                                  media_id=media['id']))
+                                  
+        except Exception as e:
+            logger.error(f"Error during Instagram upload: {e}")
+            remove_chunks(upload_id)
+            return redirect(url_for('ig_process_upload',
+                                  upload_id=upload_id,
+                                  error=str(e)))
+    
+    elif state == 'complete':
+        media_id = request.args.get('media_id')
+        return render_template('igpub-process.html',
+                             state='complete',
+                             media_id=media_id)
+    
+    return render_template('igpub-process.html',
+                         state=state,
+                         upload_id=upload_id)
+
+def ig_save_metadata(upload_id, metadata):
+    session[f'metadata_{upload_id}'] = {
+        'title': metadata.get('title'),
+        'caption': metadata.get('caption'),
+    }
+
+##################################################################################
+# <- INSTAGRAM
+##################################################################################
+
 
 ##################################################################################
 # TIKTOK ->
